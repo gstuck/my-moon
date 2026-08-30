@@ -73,6 +73,23 @@ function resizeImageFile(file, maxDim, quality){
   });
 }
 
+function resizeDataUrl(dataUrl, maxDim, quality){
+  return new Promise((resolve, reject)=>{
+    const img = new Image();
+    img.onload = ()=>{
+      let w = img.width, h = img.height;
+      if(w > h && w > maxDim){ h = Math.round(h*maxDim/w); w = maxDim; }
+      else if(h >= w && h > maxDim){ w = Math.round(w*maxDim/h); h = maxDim; }
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = ()=> reject(new Error('image load failed'));
+    img.src = dataUrl;
+  });
+}
+
 async function dataUrlToBlob(dataUrl){
   const res = await fetch(dataUrl);
   return await res.blob();
@@ -235,55 +252,34 @@ function fileToBase64(file){
   });
 }
 
-let heic2anyPromise = null;
-function loadHeic2any(){
-  if(window.heic2any) return Promise.resolve();
-  if(heic2anyPromise) return heic2anyPromise;
-  heic2anyPromise = new Promise((res,rej)=>{
-    const s = document.createElement('script');
-    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/heic2any/0.0.1/index.min.js';
-    s.onload = ()=> res();
-    s.onerror = ()=> rej(new Error('converter failed to load'));
-    document.head.appendChild(s);
-  });
-  return heic2anyPromise;
-}
-
 function isHeic(file){
   const t = (file.type||'').toLowerCase();
   const n = (file.name||'').toLowerCase();
   return t.includes('heic') || t.includes('heif') || n.endsWith('.heic') || n.endsWith('.heif');
 }
 
-async function ensureJpeg(file){
-  if(!isHeic(file)) return file;
-  await loadHeic2any();
-  const blob = await window.heic2any({ blob: file, toType: 'image/jpeg', quality: 0.9 });
-  const outBlob = Array.isArray(blob) ? blob[0] : blob;
-  return new File([outBlob], (file.name||'photo').replace(/\.(heic|heif)$/i,'.jpg'), { type: 'image/jpeg' });
-}
-
 async function extractFromImage(rawFile, appendMode){
   extracting = true; extractError=''; render();
   try {
-    let file = rawFile;
-    try {
-      file = await ensureJpeg(rawFile);
-    } catch(convErr){
-      extracting = false;
-      extractError = 'This looks like a HEIC photo and the in-browser converter could not load. Turn off "High Efficiency" for your camera in iPhone Settings > Camera > Formats (choose "Most Compatible"), or use the paste-in option below instead.';
-      render();
-      return;
-    }
-    const b64 = await fileToBase64(file);
-    const mediaType = file.type || 'image/jpeg';
-    let thumbDataUrl = null;
-    try { thumbDataUrl = await resizeImageFile(file, 1200, 0.72); } catch(e){ thumbDataUrl = null; }
+    const b64 = await fileToBase64(rawFile);
+    const mediaType = isHeic(rawFile) ? 'image/heic' : (rawFile.type || 'image/jpeg');
     const { data: fnData, error: fnError } = await sb.functions.invoke('extract-labs', {
       body: { imageBase64: b64, mediaType }
     });
     if(fnError) throw fnError;
-    const parsed = typeof fnData === 'string' ? JSON.parse(fnData.replace(/```json|```/g,'').trim()) : fnData;
+    const payload = typeof fnData === 'string' ? JSON.parse(fnData) : fnData;
+    if(payload.error) throw new Error(payload.error);
+    const parsed = payload.extraction || payload;
+
+    let thumbDataUrl = null;
+    try {
+      if(payload.convertedJpegBase64){
+        thumbDataUrl = await resizeDataUrl('data:image/jpeg;base64,'+payload.convertedJpegBase64, 1200, 0.72);
+      } else {
+        thumbDataUrl = await resizeImageFile(rawFile, 1200, 0.72);
+      }
+    } catch(e){ thumbDataUrl = null; }
+
     const newRows = buildRowsFromParsed(parsed);
     if(appendMode && pendingExtraction){
       pendingExtraction.rows = pendingExtraction.rows.concat(newRows);
@@ -463,8 +459,8 @@ function renderAddTab(){
         ${extractError && !extractError.startsWith('IMPORT:') ? `<div style="margin-top:16px;font-size:13px;color:${HIGH};">${esc(extractError)}</div>` : ''}
       </div>
       <div style="border:1px solid ${LINE};border-radius:10px;padding:20px;margin-top:14px;background:${CARD};">
-        <div style="font-size:13px;font-weight:500;margin-bottom:4px;">HEIC photo not converting?</div>
-        <div style="font-size:12px;color:${SUB};margin-bottom:10px;">Some phone photos use a format the in-browser converter can't handle. Paste a photo of the report directly to Claude in chat and ask it to extract the values -- it'll hand back a small block of text. Paste that here.</div>
+        <div style="font-size:13px;font-weight:500;margin-bottom:4px;">Photo not scanning?</div>
+        <div style="font-size:12px;color:${SUB};margin-bottom:10px;">HEIC photos are now converted on the server automatically, so this should be rare. If a photo still won't scan, paste it directly to Claude in chat and ask it to extract the values -- it'll hand back a small block of text. Paste that here.</div>
         <textarea id="lt-paste-json" rows="4" placeholder="Paste extracted data here" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;font-size:12px;font-family:inherit;"></textarea>
         <div style="margin-top:8px;"><button id="lt-paste-import" style="background:none;border:1px solid ${LINE};padding:8px 14px;border-radius:6px;font-size:13px;color:${INK};">Import</button></div>
         ${extractError.startsWith('IMPORT:') ? `<div style="margin-top:8px;font-size:12px;color:${HIGH};">${esc(extractError.replace('IMPORT:',''))}</div>` : ''}
@@ -660,8 +656,19 @@ async function openLightboxForOrder(orderId, photoCount){
 
 async function attachPhotoToOrder(orderId, file){
   try {
-    const jpegFile = await ensureJpeg(file);
-    const dataUrl = await resizeImageFile(jpegFile, 1200, 0.72);
+    let dataUrl;
+    if(isHeic(file)){
+      const b64 = await fileToBase64(file);
+      const { data: fnData, error: fnError } = await sb.functions.invoke('extract-labs', {
+        body: { imageBase64: b64, mediaType: 'image/heic' }
+      });
+      if(fnError) throw fnError;
+      const payload = typeof fnData === 'string' ? JSON.parse(fnData) : fnData;
+      if(!payload.convertedJpegBase64) throw new Error('server could not convert this HEIC photo');
+      dataUrl = await resizeDataUrl('data:image/jpeg;base64,'+payload.convertedJpegBase64, 1200, 0.72);
+    } else {
+      dataUrl = await resizeImageFile(file, 1200, 0.72);
+    }
     const blob = await dataUrlToBlob(dataUrl);
     const o = ORDERS.find(x=>x.id===orderId);
     const idx = o.photoCount || 0;
