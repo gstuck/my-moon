@@ -133,7 +133,7 @@ function moveResult(resultId, targetTestId){
     if(!stillUsed) oldCat.aliases = oldCat.aliases.filter(a=>normalize(a)!==normalize(r.rawLabel));
   }
   r.testId = newTestId;
-  saveResults(); saveCatalog();
+  saveCatalog(); saveResults();
   movingResultId = null;
   render();
 }
@@ -261,8 +261,24 @@ function isHeic(file){
 async function extractFromImage(rawFile, appendMode){
   extracting = true; extractError=''; render();
   try {
-    const b64 = await fileToBase64(rawFile);
-    const mediaType = isHeic(rawFile) ? 'image/heic' : (rawFile.type || 'image/jpeg');
+    let b64, mediaType, extractionDataUrl = null, thumbDataUrl = null;
+
+    // Try letting the browser itself decode the photo -- this works for JPEG/PNG always,
+    // and for HEIC specifically on any Apple device (iOS/Safari have native OS-level HEIC
+    // support), which avoids ever sending a large raw file to the server at all.
+    try { extractionDataUrl = await resizeImageFile(rawFile, 1568, 0.85); } catch(e){ extractionDataUrl = null; }
+
+    if(extractionDataUrl){
+      b64 = extractionDataUrl.split(',')[1];
+      mediaType = 'image/jpeg';
+      try { thumbDataUrl = await resizeDataUrl(extractionDataUrl, 1200, 0.72); } catch(e){ thumbDataUrl = extractionDataUrl; }
+    } else {
+      // Browser couldn't decode this file itself (e.g. HEIC on a non-Apple browser) --
+      // fall back to sending the original to the server for conversion.
+      b64 = await fileToBase64(rawFile);
+      mediaType = isHeic(rawFile) ? 'image/heic' : (rawFile.type || 'image/jpeg');
+    }
+
     const { data: fnData, error: fnError } = await sb.functions.invoke('extract-labs', {
       body: { imageBase64: b64, mediaType }
     });
@@ -271,14 +287,13 @@ async function extractFromImage(rawFile, appendMode){
     if(payload.error) throw new Error(payload.error);
     const parsed = payload.extraction || payload;
 
-    let thumbDataUrl = null;
-    try {
-      if(payload.convertedJpegBase64){
-        thumbDataUrl = await resizeDataUrl('data:image/jpeg;base64,'+payload.convertedJpegBase64, 1200, 0.72);
-      } else {
-        thumbDataUrl = await resizeImageFile(rawFile, 1200, 0.72);
-      }
-    } catch(e){ thumbDataUrl = null; }
+    if(!thumbDataUrl){
+      try {
+        if(payload.convertedJpegBase64){
+          thumbDataUrl = await resizeDataUrl('data:image/jpeg;base64,'+payload.convertedJpegBase64, 1200, 0.72);
+        }
+      } catch(e){ thumbDataUrl = null; }
+    }
 
     const newRows = buildRowsFromParsed(parsed);
     if(appendMode && pendingExtraction){
@@ -402,7 +417,7 @@ async function saveExtraction(){
       flag: r.flag || ''
     });
   }
-  await saveOrders(); await saveResults(); await saveCatalog();
+  await saveOrders(); await saveCatalog(); await saveResults();
   pendingExtraction = null;
   activeTab = 'results';
   render();
@@ -656,8 +671,9 @@ async function openLightboxForOrder(orderId, photoCount){
 
 async function attachPhotoToOrder(orderId, file){
   try {
-    let dataUrl;
-    if(isHeic(file)){
+    let dataUrl = null;
+    try { dataUrl = await resizeImageFile(file, 1200, 0.72); } catch(e){ dataUrl = null; }
+    if(!dataUrl){
       const b64 = await fileToBase64(file);
       const { data: fnData, error: fnError } = await sb.functions.invoke('extract-labs', {
         body: { imageBase64: b64, mediaType: 'image/heic' }
@@ -666,8 +682,6 @@ async function attachPhotoToOrder(orderId, file){
       const payload = typeof fnData === 'string' ? JSON.parse(fnData) : fnData;
       if(!payload.convertedJpegBase64) throw new Error('server could not convert this HEIC photo');
       dataUrl = await resizeDataUrl('data:image/jpeg;base64,'+payload.convertedJpegBase64, 1200, 0.72);
-    } else {
-      dataUrl = await resizeImageFile(file, 1200, 0.72);
     }
     const blob = await dataUrlToBlob(dataUrl);
     const o = ORDERS.find(x=>x.id===orderId);
