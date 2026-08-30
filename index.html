@@ -258,23 +258,54 @@ function isHeic(file){
   return t.includes('heic') || t.includes('heif') || n.endsWith('.heic') || n.endsWith('.heif');
 }
 
+let heicToPromise = null;
+function loadHeicTo(){
+  if(window.HeicTo) return Promise.resolve();
+  if(heicToPromise) return heicToPromise;
+  heicToPromise = new Promise((resolve, reject)=>{
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/heic-to@1.5.2/dist/iife/heic-to.js';
+    s.onload = ()=> resolve();
+    s.onerror = ()=> reject(new Error('HEIC converter failed to load'));
+    document.head.appendChild(s);
+  });
+  return heicToPromise;
+}
+
+async function browserHeicConvert(file){
+  await loadHeicTo();
+  const jpegBlob = await window.HeicTo({ blob: file, type: 'image/jpeg', quality: 0.85 });
+  return new File([jpegBlob], (file.name||'photo').replace(/\.(heic|heif)$/i,'.jpg'), { type: 'image/jpeg' });
+}
+
 async function extractFromImage(rawFile, appendMode){
   extracting = true; extractError=''; render();
   try {
     let b64, mediaType, extractionDataUrl = null, thumbDataUrl = null;
 
-    // Try letting the browser itself decode the photo -- this works for JPEG/PNG always,
-    // and for HEIC specifically on any Apple device (iOS/Safari have native OS-level HEIC
-    // support), which avoids ever sending a large raw file to the server at all.
+    // Tier 1: let the browser decode the photo itself. Works for JPEG/PNG always,
+    // and for HEIC on any Apple device (iOS/Safari have native OS-level HEIC support) --
+    // no library download, no server round-trip.
     try { extractionDataUrl = await resizeImageFile(rawFile, 1568, 0.85); } catch(e){ extractionDataUrl = null; }
+
+    // Tier 2: if that failed and it's a HEIC file, convert it right here in the browser
+    // using a proper WASM decoder -- works on any OS/browser, and since it runs in the
+    // browser (plenty of memory) rather than the server (a tight, fixed memory limit),
+    // it isn't constrained the way the server-side fallback is.
+    if(!extractionDataUrl && isHeic(rawFile)){
+      try {
+        const converted = await browserHeicConvert(rawFile);
+        extractionDataUrl = await resizeImageFile(converted, 1568, 0.85);
+      } catch(e){ extractionDataUrl = null; }
+    }
 
     if(extractionDataUrl){
       b64 = extractionDataUrl.split(',')[1];
       mediaType = 'image/jpeg';
       try { thumbDataUrl = await resizeDataUrl(extractionDataUrl, 1200, 0.72); } catch(e){ thumbDataUrl = extractionDataUrl; }
     } else {
-      // Browser couldn't decode this file itself (e.g. HEIC on a non-Apple browser) --
-      // fall back to sending the original to the server for conversion.
+      // Tier 3 (last resort): send the original to the server for conversion.
+      // Only reached if the browser truly could not decode this file at all.
       b64 = await fileToBase64(rawFile);
       mediaType = isHeic(rawFile) ? 'image/heic' : (rawFile.type || 'image/jpeg');
     }
@@ -673,6 +704,12 @@ async function attachPhotoToOrder(orderId, file){
   try {
     let dataUrl = null;
     try { dataUrl = await resizeImageFile(file, 1200, 0.72); } catch(e){ dataUrl = null; }
+    if(!dataUrl && isHeic(file)){
+      try {
+        const converted = await browserHeicConvert(file);
+        dataUrl = await resizeImageFile(converted, 1200, 0.72);
+      } catch(e){ dataUrl = null; }
+    }
     if(!dataUrl){
       const b64 = await fileToBase64(file);
       const { data: fnData, error: fnError } = await sb.functions.invoke('extract-labs', {
