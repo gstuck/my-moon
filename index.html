@@ -1,0 +1,1076 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab tracker</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<style>
+body { margin: 0; }
+#lt-app { font-family: 'IBM Plex Sans', -apple-system, sans-serif; color: #1B1F1D; background: #F6F6F3; padding: 0; max-width: 100%; box-sizing: border-box; min-height: 100vh; }
+#lt-app * { box-sizing: border-box; }
+.lt-mono { font-family: 'IBM Plex Mono', 'SF Mono', monospace; }
+.lt-head { font-family: 'Space Grotesk', 'IBM Plex Sans', sans-serif; }
+#lt-app button { font-family: inherit; cursor: pointer; }
+#lt-app input, #lt-app select { font-family: inherit; }
+.lt-scroll::-webkit-scrollbar { height: 8px; width: 8px; }
+.lt-scroll::-webkit-scrollbar-thumb { background: #C8CBC3; border-radius: 4px; }
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+</head>
+<body>
+<div id="lt-app"></div>
+<script>
+(function(){
+const root = document.getElementById('lt-app');
+
+// Safe to be public -- security comes from database rules, not from hiding these.
+const SUPABASE_URL = 'https://fghdknivmeiribsoprlp.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZnaGRrbml2bWVpcmlic29wcmxwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxMTU4MzIsImV4cCI6MjEwMzY5MTgzMn0.fINyTU0DK_B8LMNSTxEI4iWNSh-ST4Q5pAkO67vwUX8';
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const INK = '#1B1F1D', SUB = '#5B615C', LINE = '#DDDFDA', PAPER='#F6F6F3', CARD='#FFFFFF';
+const TEAL = '#0E6F64', TEAL_BG = '#E4F2EF';
+const HIGH = '#B34700', HIGH_BG = '#FBEDE3';
+const LOW = '#2A5EAA', LOW_BG = '#E9F0FA';
+
+function uid(){ return 'id_' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
+
+let CATALOG = [], ORDERS = [], RESULTS = [], loaded = false;
+let session = null;
+let isEditor = false;
+let loginError = '';
+let loggingIn = false;
+let activeTab = 'add';
+let pendingExtraction = null;
+let extracting = false;
+let extractError = '';
+let expandedTest = null;
+let movingResultId = null;
+let editingResultId = null;
+let editingOrderId = null;
+let expandedOrder = null;
+let lightboxPhotos = null;
+let lightboxIndex = 0;
+
+
+function resizeImageFile(file, maxDim, quality){
+  return new Promise((resolve, reject)=>{
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = ()=>{
+      let w = img.width, h = img.height;
+      if(w > h && w > maxDim){ h = Math.round(h*maxDim/w); w = maxDim; }
+      else if(h >= w && h > maxDim){ w = Math.round(w*maxDim/h); h = maxDim; }
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = ()=>{ URL.revokeObjectURL(url); reject(new Error('image load failed')); };
+    img.src = url;
+  });
+}
+
+async function dataUrlToBlob(dataUrl){
+  const res = await fetch(dataUrl);
+  return await res.blob();
+}
+async function savePhotosForOrder(orderId, dataUrls){
+  for(let i=0;i<dataUrls.length;i++){
+    try {
+      const blob = await dataUrlToBlob(dataUrls[i]);
+      const { error } = await sb.storage.from('lab-photos').upload(orderId+'/'+i+'.jpg', blob, { contentType:'image/jpeg', upsert:true });
+      if(error) console.error('photo upload failed', error);
+    }
+    catch(e){ console.error('photo save failed', e); }
+  }
+}
+async function loadPhotosForOrder(orderId, count){
+  const out = [];
+  for(let i=0;i<count;i++){
+    try {
+      const { data, error } = await sb.storage.from('lab-photos').createSignedUrl(orderId+'/'+i+'.jpg', 3600);
+      if(!error && data && data.signedUrl) out.push(data.signedUrl);
+    } catch(e){}
+  }
+  return out;
+}
+
+function moveResult(resultId, targetTestId){
+  const r = RESULTS.find(x=>x.id===resultId);
+  if(!r) return;
+  const oldTestId = r.testId;
+  let newTestId = targetTestId;
+  if(targetTestId === '__new__'){
+    newTestId = uid();
+    CATALOG.push({ id: newTestId, name: r.rawLabel || 'Untitled test', aliases: r.rawLabel ? [r.rawLabel] : [], domain: 'Uncategorized', subdomain: 'General', unit: r.unit || '', refLow: r.refLow, refHigh: r.refHigh, rangeNote: '', tags: [] });
+  } else {
+    const newCat = CATALOG.find(c=>c.id===newTestId);
+    if(newCat && r.rawLabel && !newCat.aliases.some(a=>normalize(a)===normalize(r.rawLabel))) newCat.aliases.push(r.rawLabel);
+  }
+  const oldCat = CATALOG.find(c=>c.id===oldTestId);
+  if(oldCat && r.rawLabel){
+    const stillUsed = RESULTS.some(x=>x.id!==r.id && x.testId===oldTestId && normalize(x.rawLabel)===normalize(r.rawLabel));
+    if(!stillUsed) oldCat.aliases = oldCat.aliases.filter(a=>normalize(a)!==normalize(r.rawLabel));
+  }
+  r.testId = newTestId;
+  saveResults(); saveCatalog();
+  movingResultId = null;
+  render();
+}
+
+function editResult(resultId, newValue, newUnit, newRefLow, newRefHigh){
+  const r = RESULTS.find(x=>x.id===resultId);
+  if(!r) return;
+  const v = parseFloat(newValue);
+  if(newValue.trim()==='' || isNaN(v)) return;
+  r.value = v;
+  r.valueRaw = newValue.trim();
+  r.unit = newUnit || '';
+  r.refLow = newRefLow!==''? parseFloat(newRefLow): null;
+  r.refHigh = newRefHigh!==''? parseFloat(newRefHigh): null;
+  r.flag = '';
+  saveResults();
+  editingResultId = null;
+  render();
+}
+
+
+const DEFAULT_CATALOG = [
+  {id:'t_ntprobnp', name:'NT-proBNP', aliases:['NT-proBNP','NTproBNP','NT pro BNP'], domain:'Cardiology', subdomain:'Heart failure markers', unit:'pg/mL', refLow:null, refHigh:null, rangeNote:'Age-dependent threshold, not a flat range: <300 pg/mL rules out heart failure at any age. Heart failure likely if >= 450 (age <50), >= 900 (age 50-75), >= 1800 (age >75).', tags:['heart failure']},
+  {id:'t_vitd', name:'Vitamin D, 25-Hydroxy', aliases:['Vitamin D, 25-Hydroxy','Vitamin D','25-OH Vitamin D','Vit D 25-OH'], domain:'Endocrinology', subdomain:'Vitamins & minerals', unit:'ng/mL', refLow:null, refHigh:null, rangeNote:'', tags:[]},
+  {id:'t_creatinine', name:'Creatinine', aliases:['Creatinine','Creat'], domain:'Renal', subdomain:'Kidney function', unit:'mg/dL', refLow:0.60, refHigh:1.30, rangeNote:'', tags:['kidney']},
+  {id:'t_bun', name:'BUN', aliases:['BUN','Blood Urea Nitrogen'], domain:'Renal', subdomain:'Kidney function', unit:'mg/dL', refLow:8, refHigh:23, rangeNote:'', tags:['kidney']},
+  {id:'t_tsh', name:'TSH', aliases:['TSH','Thyroid Stimulating Hormone'], domain:'Endocrinology', subdomain:'Thyroid', unit:'mIU/L', refLow:null, refHigh:null, rangeNote:'', tags:[]},
+  {id:'t_egfr_ckdepi', name:'eGFR (2021 CKD-EPI)', aliases:['eGFR (2021 CKD-EPI)','eGFR CKD-EPI 2021'], domain:'Renal', subdomain:'Kidney function', unit:'mL/min/1.73m2', refLow:60, refHigh:null, rangeNote:'', tags:['kidney','heart failure']},
+  {id:'t_egfr_cyscr', name:'eGFR Cys-Cr (2021 CKD-EPI)', aliases:['eGFR Cys-Cr (2021 CKD-EPI)','eGFR CYS-CR. (2021 CKD-EPI)','eGFR Cystatin-Creatinine'], domain:'Renal', subdomain:'Kidney function', unit:'mL/min/1.73m2', refLow:60, refHigh:null, rangeNote:'', tags:['kidney','heart failure']}
+];
+
+function catalogToDb(t){ return { id:t.id, name:t.name, aliases:t.aliases||[], domain:t.domain, subdomain:t.subdomain, unit:t.unit||'', ref_low:t.refLow, ref_high:t.refHigh, range_note:t.rangeNote||'', tags:t.tags||[] }; }
+function catalogFromDb(r){ return { id:r.id, name:r.name, aliases:r.aliases||[], domain:r.domain, subdomain:r.subdomain, unit:r.unit||'', refLow:r.ref_low, refHigh:r.ref_high, rangeNote:r.range_note||'', tags:r.tags||[] }; }
+function orderToDb(o){ return { id:o.id, date:o.date, ordering_physician:o.orderingPhysician||'', facility:o.facility||'', source_notes:o.sourceNotes||'', context_notes:o.contextNotes||'', photo_count:o.photoCount||0, created_at:o.createdAt||new Date().toISOString() }; }
+function orderFromDb(r){ return { id:r.id, date:r.date, orderingPhysician:r.ordering_physician||'', facility:r.facility||'', sourceNotes:r.source_notes||'', contextNotes:r.context_notes||'', photoCount:r.photo_count||0, createdAt:r.created_at }; }
+function resultToDb(r){ return { id:r.id, order_id:r.orderId, test_id:r.testId, raw_label:r.rawLabel||'', value:(r.value==null||isNaN(r.value))?null:r.value, value_raw:r.valueRaw||'', unit:r.unit||'', ref_low:r.refLow, ref_high:r.refHigh, flag:r.flag||'' }; }
+function resultFromDb(r){ return { id:r.id, orderId:r.order_id, testId:r.test_id, rawLabel:r.raw_label||'', value:r.value, valueRaw:r.value_raw||'', unit:r.unit||'', refLow:r.ref_low, refHigh:r.ref_high, flag:r.flag||'' }; }
+
+async function loadAll(){
+  try {
+    const { data, error } = await sb.from('catalog').select('*');
+    if(error) throw error;
+    if(data && data.length){
+      CATALOG = data.map(catalogFromDb);
+    } else {
+      CATALOG = DEFAULT_CATALOG.slice();
+      if(isEditor) await saveCatalog();
+    }
+  } catch(e){ console.error('load catalog failed', e); CATALOG = DEFAULT_CATALOG.slice(); }
+
+  try {
+    const { data, error } = await sb.from('orders').select('*').order('date', { ascending: true });
+    if(error) throw error;
+    ORDERS = (data||[]).map(orderFromDb);
+  } catch(e){ console.error('load orders failed', e); ORDERS = []; }
+
+  try {
+    const { data, error } = await sb.from('results').select('*');
+    if(error) throw error;
+    RESULTS = (data||[]).map(resultFromDb);
+  } catch(e){ console.error('load results failed', e); RESULTS = []; }
+
+  loaded = true;
+  render();
+}
+
+async function saveCatalog(){
+  try { const { error } = await sb.from('catalog').upsert(CATALOG.map(catalogToDb)); if(error) console.error('saveCatalog error', error); }
+  catch(e){ console.error('saveCatalog failed', e); }
+}
+async function saveOrders(){
+  try { const { error } = await sb.from('orders').upsert(ORDERS.map(orderToDb)); if(error) console.error('saveOrders error', error); }
+  catch(e){ console.error('saveOrders failed', e); }
+}
+async function saveResults(){
+  try { const { error } = await sb.from('results').upsert(RESULTS.map(resultToDb)); if(error) console.error('saveResults error', error); }
+  catch(e){ console.error('saveResults failed', e); }
+}
+
+
+function normalize(s){ return (s||'').toLowerCase().replace(/[().,]/g,' ').replace(/\s+/g,' ').trim(); }
+function tokenSet(s){ return new Set(normalize(s).split(' ').filter(Boolean)); }
+function jaccard(a,b){ const inter=[...a].filter(x=>b.has(x)).length; const uni=new Set([...a,...b]).size; return uni? inter/uni : 0; }
+
+function findExactMatch(label){
+  const n = normalize(label);
+  for(const t of CATALOG){
+    if(normalize(t.name) === n) return t;
+    if(t.aliases.some(a=>normalize(a)===n)) return t;
+  }
+  return null;
+}
+function findCandidates(label){
+  const ts = tokenSet(label);
+  return CATALOG.map(t=>{
+    let best = 0;
+    const check = (other)=>{
+      const os = tokenSet(other);
+      const inter = [...ts].filter(x=>os.has(x));
+      const score = jaccard(ts, os);
+      const strong = inter.length >= 2 || (inter.length===1 && inter[0].length >= 5 && score >= 0.3);
+      if(strong && score > best) best = score;
+    };
+    check(t.name);
+    for(const a of t.aliases) check(a);
+    return {test:t, score:best};
+  }).sort((a,b)=>b.score-a.score).filter(c=>c.score>0).slice(0,4);
+}
+
+function fileToBase64(file){
+  return new Promise((res,rej)=>{
+    const r = new FileReader();
+    r.onload = ()=> res(r.result.split(',')[1]);
+    r.onerror = ()=> rej(new Error('read failed'));
+    r.readAsDataURL(file);
+  });
+}
+
+let heic2anyPromise = null;
+function loadHeic2any(){
+  if(window.heic2any) return Promise.resolve();
+  if(heic2anyPromise) return heic2anyPromise;
+  heic2anyPromise = new Promise((res,rej)=>{
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/heic2any/0.0.1/index.min.js';
+    s.onload = ()=> res();
+    s.onerror = ()=> rej(new Error('converter failed to load'));
+    document.head.appendChild(s);
+  });
+  return heic2anyPromise;
+}
+
+function isHeic(file){
+  const t = (file.type||'').toLowerCase();
+  const n = (file.name||'').toLowerCase();
+  return t.includes('heic') || t.includes('heif') || n.endsWith('.heic') || n.endsWith('.heif');
+}
+
+async function ensureJpeg(file){
+  if(!isHeic(file)) return file;
+  await loadHeic2any();
+  const blob = await window.heic2any({ blob: file, toType: 'image/jpeg', quality: 0.9 });
+  const outBlob = Array.isArray(blob) ? blob[0] : blob;
+  return new File([outBlob], (file.name||'photo').replace(/\.(heic|heif)$/i,'.jpg'), { type: 'image/jpeg' });
+}
+
+async function extractFromImage(rawFile, appendMode){
+  extracting = true; extractError=''; render();
+  try {
+    let file = rawFile;
+    try {
+      file = await ensureJpeg(rawFile);
+    } catch(convErr){
+      extracting = false;
+      extractError = 'This looks like a HEIC photo and the in-browser converter could not load. Turn off "High Efficiency" for your camera in iPhone Settings > Camera > Formats (choose "Most Compatible"), or use the paste-in option below instead.';
+      render();
+      return;
+    }
+    const b64 = await fileToBase64(file);
+    const mediaType = file.type || 'image/jpeg';
+    let thumbDataUrl = null;
+    try { thumbDataUrl = await resizeImageFile(file, 1200, 0.72); } catch(e){ thumbDataUrl = null; }
+    const { data: fnData, error: fnError } = await sb.functions.invoke('extract-labs', {
+      body: { imageBase64: b64, mediaType }
+    });
+    if(fnError) throw fnError;
+    const parsed = typeof fnData === 'string' ? JSON.parse(fnData.replace(/```json|```/g,'').trim()) : fnData;
+    const newRows = buildRowsFromParsed(parsed);
+    if(appendMode && pendingExtraction){
+      pendingExtraction.rows = pendingExtraction.rows.concat(newRows);
+      if(thumbDataUrl) pendingExtraction.photos.push(thumbDataUrl);
+    } else {
+      pendingExtraction = {
+        reportDate: parsed.reportDate || '',
+        orderingPhysician: parsed.orderingPhysician || '',
+        facility: parsed.facility || '',
+        sourceNotes: parsed.notes || '',
+        contextNotes: '',
+        photos: thumbDataUrl ? [thumbDataUrl] : [],
+        rows: newRows
+      };
+    }
+  } catch(e){
+    extractError = 'Could not read this image. Try a clearer or better-lit photo, or crop to the results section, then try again. (' + (e.message||e) + ')';
+    pendingExtraction = null;
+  }
+  extracting = false;
+  render();
+}
+
+function startManualEntry(){
+  pendingExtraction = { reportDate:'', orderingPhysician:'', facility:'', sourceNotes:'', contextNotes:'', photos:[], rows:[] };
+  render();
+}
+
+function buildRowsFromParsed(parsed){
+  return (parsed.tests||[]).map(t=>{
+    const exact = findExactMatch(t.label);
+    const candidates = exact ? [] : findCandidates(t.label);
+    const confident = candidates.length && candidates[0].score >= 0.45;
+    return {
+      rowId: uid(),
+      rawLabel: t.label || '',
+      value: t.value != null ? String(t.value) : '',
+      unit: t.unit || '',
+      refLow: t.refRangeLow != null ? String(t.refRangeLow) : '',
+      refHigh: t.refRangeHigh != null ? String(t.refRangeHigh) : '',
+      flag: t.flag || '',
+      include: true,
+      matchMode: exact ? 'exact' : (confident ? 'suggest' : candidates.length ? 'weak' : 'new'),
+      matchedTestId: exact ? exact.id : (confident ? candidates[0].test.id : '__new__'),
+      candidates
+    };
+  });
+}
+
+function importPastedJson(appendMode){
+  const el = root.querySelector('#lt-paste-json');
+  const raw = el ? el.value.trim() : '';
+  if(!raw){ extractError = 'IMPORT:Paste the extracted data block first.'; render(); return; }
+  try {
+    const clean = raw.replace(/```json|```/g,'').trim();
+    const parsed = JSON.parse(clean);
+    const newRows = buildRowsFromParsed(parsed);
+    if(appendMode && pendingExtraction){
+      pendingExtraction.rows = pendingExtraction.rows.concat(newRows);
+    } else {
+      pendingExtraction = {
+        reportDate: parsed.reportDate || '',
+        orderingPhysician: parsed.orderingPhysician || '',
+        facility: parsed.facility || '',
+        sourceNotes: parsed.notes || '',
+        contextNotes: '',
+        photos: [],
+        rows: newRows
+      };
+    }
+    extractError = '';
+  } catch(e){
+    extractError = 'IMPORT:That did not look like valid extracted data. Make sure you pasted the whole block Claude gave you.';
+  }
+  render();
+}
+function addBlankRow(){
+  pendingExtraction.rows.push({
+    rowId: uid(), rawLabel:'', value:'', unit:'', refLow:'', refHigh:'', flag:'',
+    include:true, matchMode:'new', matchedTestId:'__new__', candidates:[]
+  });
+  render();
+}
+
+async function saveExtraction(){
+  if(!pendingExtraction) return;
+  const rows = pendingExtraction.rows.filter(r=>r.include && r.rawLabel.trim() && r.value.trim());
+  if(!rows.length){ return; }
+  const orderId = uid();
+  const photos = pendingExtraction.photos || [];
+  ORDERS.push({
+    id: orderId,
+    date: pendingExtraction.reportDate || new Date().toISOString().slice(0,10),
+    orderingPhysician: pendingExtraction.orderingPhysician || '',
+    facility: pendingExtraction.facility || '',
+    sourceNotes: pendingExtraction.sourceNotes || '',
+    contextNotes: pendingExtraction.contextNotes || '',
+    photoCount: photos.length,
+    createdAt: new Date().toISOString()
+  });
+  if(photos.length) await savePhotosForOrder(orderId, photos);
+  for(const r of rows){
+    let testId = r.matchedTestId;
+    if(testId === '__new__'){
+      testId = uid();
+      const rl = r.refLow!==''? parseFloat(r.refLow): null;
+      const rh = r.refHigh!==''? parseFloat(r.refHigh): null;
+      CATALOG.push({ id: testId, name: r.rawLabel.trim(), aliases:[r.rawLabel.trim()], domain: r.newDomain || 'Uncategorized', subdomain: r.newSubdomain || 'General', unit: r.unit || '', refLow: rl, refHigh: rh, rangeNote: '', tags: [] });
+    } else {
+      const cat = CATALOG.find(c=>c.id===testId);
+      if(cat && !cat.aliases.some(a=>normalize(a)===normalize(r.rawLabel))) cat.aliases.push(r.rawLabel.trim());
+    }
+    RESULTS.push({
+      id: uid(), orderId, testId,
+      rawLabel: r.rawLabel.trim(),
+      value: parseFloat(r.value), valueRaw: r.value.trim(),
+      unit: r.unit || '',
+      refLow: r.refLow!==''? parseFloat(r.refLow): null,
+      refHigh: r.refHigh!==''? parseFloat(r.refHigh): null,
+      flag: r.flag || ''
+    });
+  }
+  await saveOrders(); await saveResults(); await saveCatalog();
+  pendingExtraction = null;
+  activeTab = 'results';
+  render();
+}
+
+function cancelExtraction(){ pendingExtraction = null; extractError=''; render(); }
+
+function computeFlag(r){
+  if(r.flag) return r.flag.toUpperCase().startsWith('H') ? 'H' : r.flag.toUpperCase().startsWith('L') ? 'L' : 'normal';
+  if(r.refLow!=null && !isNaN(r.value) && r.value < r.refLow) return 'L';
+  if(r.refHigh!=null && !isNaN(r.value) && r.value > r.refHigh) return 'H';
+  return 'normal';
+}
+
+function sparkline(values){
+  if(values.length < 2) return '';
+  const w=90,h=26,pad=3;
+  const nums = values.map(v=>v.value).filter(v=>!isNaN(v));
+  if(nums.length<2) return '';
+  const min=Math.min(...nums), max=Math.max(...nums);
+  const range = (max-min)||1;
+  const pts = values.map((v,i)=>{
+    const x = pad + (i/(values.length-1))*(w-2*pad);
+    const y = h-pad - ((v.value-min)/range)*(h-2*pad);
+    return {x,y,flag:v.flag};
+  });
+  const path = pts.map((p,i)=> (i===0?'M':'L')+p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ');
+  const dots = pts.map(p=>{
+    const c = p.flag==='H'?HIGH:p.flag==='L'?LOW:TEAL;
+    return `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2" fill="${c}"/>`;
+  }).join('');
+  return `<svg width="${w}" height="${h}" style="display:block"><path d="${path}" fill="none" stroke="${LINE}" stroke-width="1.5"/>${dots}</svg>`;
+}
+
+function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function tabBtn(id,label){
+  const active = activeTab===id;
+  return `<button data-tab="${id}" style="padding:10px 16px;border:none;background:none;border-bottom:2px solid ${active?TEAL:'transparent'};color:${active?INK:SUB};font-weight:${active?600:400};font-size:14px;">${label}</button>`;
+}
+
+function renderAddTab(){
+  let html = '';
+  if(!pendingExtraction){
+    html += `
+    <div style="max-width:520px;margin:0 auto;padding:32px 16px;">
+      <div style="border:1px dashed ${LINE};border-radius:10px;padding:28px 20px;text-align:center;background:${CARD};">
+        <div class="lt-head" style="font-size:16px;font-weight:600;margin-bottom:6px;">Add a lab report</div>
+        <div style="font-size:13px;color:${SUB};margin-bottom:18px;">Photograph or upload a lab report. Values are read from the image and never stored -- only the extracted numbers are saved.</div>
+        <input type="file" accept="image/*,.heic,.heif" id="lt-file-input" style="display:none"/>
+        <button id="lt-upload-btn" style="background:${TEAL};color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:14px;font-weight:500;margin-right:8px;">Choose photo</button>
+        <button id="lt-manual-btn" style="background:none;border:1px solid ${LINE};padding:10px 18px;border-radius:8px;font-size:14px;color:${INK};">Enter manually</button>
+        ${extracting ? `<div style="margin-top:16px;font-size:13px;color:${TEAL};">Reading report...</div>` : ''}
+        ${extractError && !extractError.startsWith('IMPORT:') ? `<div style="margin-top:16px;font-size:13px;color:${HIGH};">${esc(extractError)}</div>` : ''}
+      </div>
+      <div style="border:1px solid ${LINE};border-radius:10px;padding:20px;margin-top:14px;background:${CARD};">
+        <div style="font-size:13px;font-weight:500;margin-bottom:4px;">HEIC photo not converting?</div>
+        <div style="font-size:12px;color:${SUB};margin-bottom:10px;">Some phone photos use a format the in-browser converter can't handle. Paste a photo of the report directly to Claude in chat and ask it to extract the values -- it'll hand back a small block of text. Paste that here.</div>
+        <textarea id="lt-paste-json" rows="4" placeholder="Paste extracted data here" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;font-size:12px;font-family:inherit;"></textarea>
+        <div style="margin-top:8px;"><button id="lt-paste-import" style="background:none;border:1px solid ${LINE};padding:8px 14px;border-radius:6px;font-size:13px;color:${INK};">Import</button></div>
+        ${extractError.startsWith('IMPORT:') ? `<div style="margin-top:8px;font-size:12px;color:${HIGH};">${esc(extractError.replace('IMPORT:',''))}</div>` : ''}
+      </div>
+    </div>`;
+  } else {
+    const p = pendingExtraction;
+    html += `<div style="max-width:900px;margin:0 auto;padding:24px 16px 60px;">
+      <div class="lt-head" style="font-size:18px;font-weight:600;margin-bottom:16px;">Review report</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;">
+        <label style="font-size:12px;color:${SUB};">Report date
+          <input type="date" id="lt-meta-date" value="${esc(p.reportDate)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Ordering physician
+          <input type="text" id="lt-meta-phys" value="${esc(p.orderingPhysician)}" placeholder="Dr. name" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Facility / lab
+          <input type="text" id="lt-meta-facility" value="${esc(p.facility)}" placeholder="Lab name" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px;">
+        <label style="font-size:12px;color:${SUB};">Source notes (accession/order #s, for tracing back to the report)
+          <input type="text" id="lt-meta-source-notes" value="${esc(p.sourceNotes||'')}" placeholder="e.g. Accession JU112052" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Context notes (patient/clinical context, e.g. fasting, recent ER visit)
+          <input type="text" id="lt-meta-context-notes" value="${esc(p.contextNotes||'')}" placeholder="e.g. 5 days post-fasting" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+      </div>
+      <div style="overflow-x:auto;" class="lt-scroll">
+      <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:820px;">
+        <thead><tr style="text-align:left;color:${SUB};border-bottom:1px solid ${LINE};">
+          <th style="padding:6px 8px;width:26px;"></th>
+          <th style="padding:6px 8px;">Printed label</th>
+          <th style="padding:6px 8px;">Matched to</th>
+          <th style="padding:6px 8px;width:90px;">Value</th>
+          <th style="padding:6px 8px;width:80px;">Unit</th>
+          <th style="padding:6px 8px;width:70px;">Ref low</th>
+          <th style="padding:6px 8px;width:70px;">Ref high</th>
+          <th style="padding:6px 8px;width:110px;">vs usual range</th>
+          <th style="padding:6px 8px;width:26px;"></th>
+        </tr></thead>
+        <tbody>
+        ${p.rows.map(r=>{
+          const badge = r.matchMode==='exact' ? `<span style="font-size:11px;background:${TEAL_BG};color:${TEAL};padding:2px 6px;border-radius:4px;">known test</span>`
+            : r.matchMode==='suggest' ? `<span style="font-size:11px;background:${HIGH_BG};color:${HIGH};padding:2px 6px;border-radius:4px;">confirm match</span>`
+            : r.matchMode==='weak' ? `<span style="font-size:11px;background:${LOW_BG};color:${LOW};padding:2px 6px;border-radius:4px;">new test -- similar test exists, check dropdown</span>`
+            : `<span style="font-size:11px;background:${LOW_BG};color:${LOW};padding:2px 6px;border-radius:4px;">new test</span>`;
+          const options = [...r.candidates.map(c=>`<option value="${c.test.id}" ${r.matchedTestId===c.test.id?'selected':''}>${esc(c.test.name)} (${Math.round(c.score*100)}% match)</option>`),
+            ...CATALOG.filter(c=>!r.candidates.some(x=>x.test.id===c.id)).map(c=>`<option value="${c.id}" ${r.matchedTestId===c.id?'selected':''}>${esc(c.name)}</option>`),
+            `<option value="__new__" ${r.matchedTestId==='__new__'?'selected':''}>+ Create new test: "${esc(r.rawLabel)}"</option>`
+          ].join('');
+          const matchedCat = r.matchedTestId!=='__new__' ? CATALOG.find(c=>c.id===r.matchedTestId) : null;
+          let rangeHint = '';
+          if(matchedCat && (matchedCat.refLow!=null || matchedCat.refHigh!=null)){
+            const rowLow = r.refLow!==''? parseFloat(r.refLow): null;
+            const rowHigh = r.refHigh!==''? parseFloat(r.refHigh): null;
+            const same = rowLow===matchedCat.refLow && rowHigh===matchedCat.refHigh;
+            rangeHint = same
+              ? `<span style="font-size:11px;color:${TEAL};">matches usual</span>`
+              : `<span style="font-size:11px;color:${HIGH};">usual: ${matchedCat.refLow!=null?matchedCat.refLow:''}${matchedCat.refLow!=null&&matchedCat.refHigh!=null?'-':''}${matchedCat.refHigh!=null?matchedCat.refHigh:''} -- differs</span>`;
+          } else if(matchedCat && matchedCat.rangeNote){
+            rangeHint = `<span style="font-size:11px;color:${SUB};" title="${esc(matchedCat.rangeNote)}">tiered range, see catalog</span>`;
+          }
+          return `<tr data-row="${r.rowId}" style="border-bottom:1px solid ${LINE};">
+            <td style="padding:6px 8px;"><input type="checkbox" class="lt-row-include" ${r.include?'checked':''}/></td>
+            <td style="padding:6px 8px;"><input type="text" class="lt-row-label" value="${esc(r.rawLabel)}" style="width:100%;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/><div style="margin-top:2px;">${badge}</div></td>
+            <td style="padding:6px 8px;">${r.matchMode==='exact' ? `<span style="font-size:12px;">${esc(CATALOG.find(c=>c.id===r.matchedTestId)?.name||'')}</span>` : `<select class="lt-row-match" style="width:100%;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;">${options}</select>`}</td>
+            <td style="padding:6px 8px;"><input type="text" class="lt-row-value lt-mono" value="${esc(r.value)}" style="width:100%;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/></td>
+            <td style="padding:6px 8px;"><input type="text" class="lt-row-unit" value="${esc(r.unit)}" style="width:100%;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/></td>
+            <td style="padding:6px 8px;"><input type="text" class="lt-row-reflow lt-mono" value="${esc(r.refLow)}" style="width:100%;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/></td>
+            <td style="padding:6px 8px;"><input type="text" class="lt-row-refhigh lt-mono" value="${esc(r.refHigh)}" style="width:100%;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/></td>
+            <td style="padding:6px 8px;">${rangeHint}</td>
+            <td style="padding:6px 8px;"><button class="lt-row-remove" style="background:none;border:none;color:${SUB};font-size:15px;">&times;</button></td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>
+      </div>
+      <button id="lt-add-row" style="margin-top:10px;background:none;border:1px solid ${LINE};padding:6px 12px;border-radius:6px;font-size:12px;color:${INK};">+ Add row</button>
+
+      <div style="border:1px solid ${LINE};border-radius:8px;padding:14px;margin-top:20px;background:${CARD};">
+        <div style="font-size:12px;font-weight:500;margin-bottom:2px;">More pages to this same report?</div>
+        <div style="font-size:11px;color:${SUB};margin-bottom:8px;">If this order spans multiple pages (same accession/draw), add them here so everything lands in one entry. If it's a genuinely separate order, save this one first and start a new report for it.</div>
+        <input type="file" accept="image/*,.heic,.heif" id="lt-file-input-append" style="display:none"/>
+        <button id="lt-upload-append-btn" style="background:none;border:1px solid ${LINE};padding:6px 12px;border-radius:6px;font-size:12px;color:${INK};margin-right:6px;">+ Add page (photo)</button>
+        <textarea id="lt-paste-json-append" rows="2" placeholder="...or paste extracted data for the next page" style="width:100%;padding:6px;border:1px solid ${LINE};border-radius:6px;font-size:12px;font-family:inherit;margin-top:8px;"></textarea>
+        <div style="margin-top:6px;"><button id="lt-paste-import-append" style="background:none;border:1px solid ${LINE};padding:6px 12px;border-radius:6px;font-size:12px;color:${INK};">Add to this report</button></div>
+      </div>
+
+      <div style="margin-top:24px;display:flex;gap:10px;">
+        <button id="lt-save-extraction" style="background:${TEAL};color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:14px;font-weight:500;">Save to records</button>
+        <button id="lt-cancel-extraction" style="background:none;border:1px solid ${LINE};padding:10px 18px;border-radius:8px;font-size:14px;color:${INK};">Cancel</button>
+      </div>
+    </div>`;
+  }
+  return html;
+}
+
+function renderResultsTab(){
+  if(!RESULTS.length){
+    return `<div style="max-width:480px;margin:60px auto;text-align:center;color:${SUB};font-size:14px;">
+      No results yet. Add a lab report to start building the history.
+    </div>`;
+  }
+  const orderById = Object.fromEntries(ORDERS.map(o=>[o.id,o]));
+  const byDomain = {};
+  for(const t of CATALOG){
+    const has = RESULTS.some(r=>r.testId===t.id);
+    if(!has) continue;
+    byDomain[t.domain] = byDomain[t.domain] || {};
+    byDomain[t.domain][t.subdomain] = byDomain[t.domain][t.subdomain] || [];
+    byDomain[t.domain][t.subdomain].push(t);
+  }
+  let html = `<div style="max-width:1000px;margin:0 auto;padding:20px 16px 60px;">`;
+  for(const domain of Object.keys(byDomain)){
+    html += `<div class="lt-head" style="font-size:15px;font-weight:600;margin:22px 0 8px;">${esc(domain)}</div>`;
+    for(const subdomain of Object.keys(byDomain[domain])){
+      html += `<div style="font-size:12px;color:${SUB};text-transform:uppercase;letter-spacing:0.03em;margin:10px 0 6px;">${esc(subdomain)}</div>`;
+      for(const t of byDomain[domain][subdomain]){
+        const rs = RESULTS.filter(r=>r.testId===t.id).map(r=>({...r, order: orderById[r.orderId]})).sort((a,b)=>(a.order?.date||'').localeCompare(b.order?.date||''));
+        const latest = rs[rs.length-1];
+        const latestFlag = computeFlag(latest);
+        const flagColor = latestFlag==='H'?HIGH:latestFlag==='L'?LOW:INK;
+        const spark = sparkline(rs.map(r=>({value:r.value, flag:computeFlag(r)})));
+        const isOpen = expandedTest===t.id;
+        html += `<div style="background:${CARD};border:1px solid ${LINE};border-radius:8px;margin-bottom:6px;overflow:hidden;">
+          <div class="lt-test-row" data-test="${t.id}" style="display:flex;align-items:center;gap:14px;padding:10px 14px;cursor:pointer;">
+            <div style="flex:1;min-width:0;">
+              <div style="font-size:13px;font-weight:500;">${esc(t.name)}</div>
+              <div style="font-size:11px;color:${SUB};">${rs.length} result${rs.length>1?'s':''}${t.unit?' &middot; '+esc(t.unit):''}${(t.refLow!=null||t.refHigh!=null)?' &middot; usual range '+(t.refLow!=null?t.refLow:'')+((t.refLow!=null&&t.refHigh!=null)?'-':'')+(t.refHigh!=null?t.refHigh:''):''}${t.rangeNote?' &middot; <span title="'+esc(t.rangeNote)+'" style="text-decoration:underline dotted;">tiered range</span>':''}${(t.tags&&t.tags.length)?' &middot; '+t.tags.map(g=>`<span style="background:${PAPER};border:1px solid ${LINE};border-radius:3px;padding:0 4px;margin-right:3px;">${esc(g)}</span>`).join(''):''}</div>
+            </div>
+            <div>${spark}</div>
+            <div class="lt-mono" style="min-width:70px;text-align:right;font-size:14px;font-weight:500;color:${flagColor};">${esc(latest.valueRaw)}</div>
+            <div style="font-size:11px;color:${SUB};min-width:80px;text-align:right;">${esc(latest.order?.date||'')}</div>
+          </div>
+          ${isOpen ? `<div style="border-top:1px solid ${LINE};padding:8px 14px;overflow-x:auto;" class="lt-scroll">
+            <table style="width:100%;border-collapse:collapse;font-size:12px;">
+              <thead><tr style="color:${SUB};text-align:left;"><th style="padding:4px 6px;">Date</th><th style="padding:4px 6px;">Value</th><th style="padding:4px 6px;">Ref range</th><th style="padding:4px 6px;">Flag</th><th style="padding:4px 6px;">Physician</th><th style="padding:4px 6px;">Facility</th><th style="padding:4px 6px;">Source notes</th><th style="padding:4px 6px;">Context notes</th><th style="padding:4px 6px;">Printed as</th><th style="padding:4px 6px;"></th></tr></thead>
+              <tbody>
+              ${rs.slice().reverse().map(r=>{
+                const f = computeFlag(r); const fc = f==='H'?HIGH:f==='L'?LOW:SUB;
+                const isMoving = movingResultId===r.id;
+                const isEditing = isEditor && editingResultId===r.id;
+                const moveRow = isMoving ? `<tr style="border-top:1px solid ${LINE};background:${PAPER};"><td colspan="10" style="padding:8px 6px;">
+                  <span style="font-size:12px;margin-right:6px;">Move this result to:</span>
+                  <select class="lt-move-select" data-result="${r.id}" style="padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;">
+                    ${CATALOG.filter(c=>c.id!==t.id).map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')}
+                    <option value="__new__">+ Create new test: "${esc(r.rawLabel||'')}"</option>
+                  </select>
+                  <button class="lt-move-confirm" data-result="${r.id}" style="background:${TEAL};color:#fff;border:none;padding:5px 10px;border-radius:5px;font-size:12px;margin-left:6px;">Confirm move</button>
+                  <button class="lt-move-cancel" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-left:4px;">Cancel</button>
+                </td></tr>` : '';
+                const editRow = isEditing ? `<tr style="border-top:1px solid ${LINE};background:${PAPER};"><td colspan="10" style="padding:8px 6px;">
+                  <span style="font-size:11px;color:${SUB};margin-right:4px;">Value</span><input type="text" class="lt-edit-value lt-mono" data-result="${r.id}" value="${esc(r.valueRaw)}" style="width:80px;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-right:8px;"/>
+                  <span style="font-size:11px;color:${SUB};margin-right:4px;">Unit</span><input type="text" class="lt-edit-unit" data-result="${r.id}" value="${esc(r.unit)}" style="width:80px;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-right:8px;"/>
+                  <span style="font-size:11px;color:${SUB};margin-right:4px;">Ref low</span><input type="text" class="lt-edit-reflow lt-mono" data-result="${r.id}" value="${r.refLow!=null?r.refLow:''}" style="width:60px;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-right:8px;"/>
+                  <span style="font-size:11px;color:${SUB};margin-right:4px;">Ref high</span><input type="text" class="lt-edit-refhigh lt-mono" data-result="${r.id}" value="${r.refHigh!=null?r.refHigh:''}" style="width:60px;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-right:8px;"/>
+                  <button class="lt-edit-confirm" data-result="${r.id}" style="background:${TEAL};color:#fff;border:none;padding:5px 10px;border-radius:5px;font-size:12px;margin-left:4px;">Save</button>
+                  <button class="lt-edit-cancel" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-left:4px;">Cancel</button>
+                </td></tr>` : '';
+                return `<tr style="border-top:1px solid ${LINE};"><td class="lt-mono"><a href="#" class="lt-goto-order" data-order="${r.orderId}" style="padding:4px 6px;display:block;color:${TEAL};text-decoration:underline;">${esc(r.order?.date||'')}</a></td><td class="lt-mono" style="padding:4px 6px;color:${fc};">${esc(r.valueRaw)} ${esc(r.unit)}</td><td class="lt-mono" style="padding:4px 6px;color:${SUB};">${r.refLow!=null?r.refLow:''}${r.refLow!=null&&r.refHigh!=null?' - ':''}${r.refHigh!=null?r.refHigh:''}</td><td style="padding:4px 6px;color:${fc};">${f==='normal'?'':f}</td><td style="padding:4px 6px;">${esc(r.order?.orderingPhysician||'')}</td><td style="padding:4px 6px;">${esc(r.order?.facility||'')}</td><td style="padding:4px 6px;color:${SUB};font-size:11px;">${esc(r.order?.sourceNotes||'')}</td><td style="padding:4px 6px;color:${SUB};font-size:11px;">${esc(r.order?.contextNotes||'')}</td><td style="padding:4px 6px;color:${SUB};font-size:11px;">${esc(r.rawLabel||'')}</td><td style="padding:4px 6px;white-space:nowrap;">${(r.order&&r.order.photoCount) ? `<a href="#" class="lt-goto-source" data-order="${r.orderId}" data-count="${r.order.photoCount}" style="color:${TEAL};text-decoration:underline;font-size:11px;margin-right:8px;">Source</a>` : ''}${isEditor ? `<button class="lt-edit-start" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};margin-right:4px;">Edit</button><button class="lt-move-start" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};">Move</button>` : ''}</td></tr>${editRow}${moveRow}`;
+              }).join('')}
+              </tbody>
+            </table>
+          </div>` : ''}
+        </div>`;
+      }
+    }
+  }
+  html += `</div>`;
+  return html;
+}
+
+function editOrder(orderId, date, physician, facility, sourceNotes, contextNotes){
+  const o = ORDERS.find(x=>x.id===orderId);
+  if(!o) return;
+  o.date = date || o.date;
+  o.orderingPhysician = physician || '';
+  o.facility = facility || '';
+  o.sourceNotes = sourceNotes || '';
+  o.contextNotes = contextNotes || '';
+  saveOrders();
+  editingOrderId = null;
+  render();
+}
+
+async function openLightboxForOrder(orderId, photoCount){
+  const photos = await loadPhotosForOrder(orderId, photoCount);
+  lightboxPhotos = photos.length ? photos : ['__none__'];
+  lightboxIndex = 0;
+  render();
+}
+
+async function attachPhotoToOrder(orderId, file){
+  try {
+    const jpegFile = await ensureJpeg(file);
+    const dataUrl = await resizeImageFile(jpegFile, 1200, 0.72);
+    const blob = await dataUrlToBlob(dataUrl);
+    const o = ORDERS.find(x=>x.id===orderId);
+    const idx = o.photoCount || 0;
+    const { error } = await sb.storage.from('lab-photos').upload(orderId+'/'+idx+'.jpg', blob, { contentType:'image/jpeg', upsert:true });
+    if(error){ console.error('attach photo failed', error); return; }
+    o.photoCount = idx + 1;
+    await saveOrders();
+    render();
+  } catch(e){ console.error('attach photo failed', e); }
+}
+
+function renderLightbox(){
+  if(!lightboxPhotos) return '';
+  if(lightboxPhotos[0]==='__none__'){
+    return `<div id="lt-lightbox-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:9999;">
+      <div style="background:${CARD};border-radius:10px;padding:24px;max-width:320px;text-align:center;">
+        <div style="font-size:13px;color:${SUB};margin-bottom:14px;">No photo attached to this report.</div>
+        <button id="lt-lightbox-close" style="background:none;border:1px solid ${LINE};padding:8px 16px;border-radius:6px;font-size:13px;">Close</button>
+      </div>
+    </div>`;
+  }
+  const multi = lightboxPhotos.length > 1;
+  return `<div id="lt-lightbox-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.75);display:flex;align-items:center;justify-content:center;z-index:9999;padding:20px;">
+    <div style="max-width:90vw;max-height:90vh;text-align:center;">
+      <img src="${lightboxPhotos[lightboxIndex]}" style="max-width:100%;max-height:80vh;border-radius:6px;display:block;margin:0 auto;"/>
+      <div style="margin-top:12px;">
+        ${multi ? `<button id="lt-lightbox-prev" style="background:rgba(255,255,255,0.15);color:#fff;border:none;padding:8px 14px;border-radius:6px;font-size:13px;margin-right:8px;">&larr; Prev</button>` : ''}
+        <span style="color:#fff;font-size:12px;">${multi ? (lightboxIndex+1)+' of '+lightboxPhotos.length : ''}</span>
+        ${multi ? `<button id="lt-lightbox-next" style="background:rgba(255,255,255,0.15);color:#fff;border:none;padding:8px 14px;border-radius:6px;font-size:13px;margin-left:8px;">Next &rarr;</button>` : ''}
+        <button id="lt-lightbox-close" style="background:rgba(255,255,255,0.15);color:#fff;border:none;padding:8px 14px;border-radius:6px;font-size:13px;margin-left:16px;">Close</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderReportsTab(){
+  if(!ORDERS.length){
+    return `<div style="max-width:480px;margin:60px auto;text-align:center;color:${SUB};font-size:14px;">
+      No lab reports yet. Add one from the Add report tab.
+    </div>`;
+  }
+  const sorted = ORDERS.slice().sort((a,b)=> b.date.localeCompare(a.date));
+  let html = `<div style="max-width:1000px;margin:0 auto;padding:20px 16px 60px;">`;
+  for(const o of sorted){
+    const rs = RESULTS.filter(r=>r.orderId===o.id);
+    const isOpen = expandedOrder===o.id;
+    const isEditingOrder = isEditor && editingOrderId===o.id;
+    html += `<div style="background:${CARD};border:1px solid ${LINE};border-radius:8px;margin-bottom:8px;overflow:hidden;">
+      <div class="lt-order-row" data-order="${o.id}" style="display:flex;align-items:center;gap:14px;padding:12px 14px;cursor:pointer;">
+        <div style="flex:1;min-width:0;">
+          <div class="lt-mono" style="font-size:14px;font-weight:500;">${esc(o.date)}</div>
+          <div style="font-size:11px;color:${SUB};">${esc(o.orderingPhysician||'Physician not recorded')}${o.facility?' &middot; '+esc(o.facility):''} &middot; ${rs.length} result${rs.length!==1?'s':''}</div>
+        </div>
+        <div style="font-size:11px;color:${SUB};">${o.photoCount?o.photoCount+' photo'+(o.photoCount>1?'s':''):'no photo'}</div>
+      </div>
+      ${isOpen ? `<div style="border-top:1px solid ${LINE};padding:12px 14px;">
+        ${isEditingOrder ? `<div style="background:${PAPER};border-radius:6px;padding:10px;margin-bottom:10px;">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
+            <label style="font-size:11px;color:${SUB};">Date<input type="date" class="lt-order-edit-date" data-order="${o.id}" value="${esc(o.date)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Physician<input type="text" class="lt-order-edit-phys" data-order="${o.id}" value="${esc(o.orderingPhysician)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Facility<input type="text" class="lt-order-edit-facility" data-order="${o.id}" value="${esc(o.facility)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;">
+            <label style="font-size:11px;color:${SUB};">Source notes<input type="text" class="lt-order-edit-source" data-order="${o.id}" value="${esc(o.sourceNotes)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Context notes<input type="text" class="lt-order-edit-context" data-order="${o.id}" value="${esc(o.contextNotes)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+          </div>
+          <button class="lt-order-edit-save" data-order="${o.id}" style="background:${TEAL};color:#fff;border:none;padding:6px 12px;border-radius:5px;font-size:12px;margin-right:6px;">Save</button>
+          <button class="lt-order-edit-cancel" style="background:none;border:1px solid ${LINE};padding:6px 12px;border-radius:5px;font-size:12px;">Cancel</button>
+        </div>` : `<div style="margin-bottom:10px;">
+          <div style="font-size:12px;margin-bottom:2px;"><span style="color:${SUB};">Source notes:</span> ${esc(o.sourceNotes)||'&mdash;'}</div>
+          <div style="font-size:12px;margin-bottom:8px;"><span style="color:${SUB};">Context notes:</span> ${esc(o.contextNotes)||'&mdash;'}</div>
+          <button class="lt-order-view-photo" data-order="${o.id}" data-count="${o.photoCount||0}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-right:6px;">${o.photoCount?'View source photo':'No photo attached'}</button>
+          ${isEditor ? `<button class="lt-order-edit-start" data-order="${o.id}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-right:6px;">Edit details</button>
+          <input type="file" accept="image/*,.heic,.heif" class="lt-order-attach-input" data-order="${o.id}" style="display:none"/>
+          <button class="lt-order-attach-btn" data-order="${o.id}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;">${o.photoCount?'Add another photo':'Attach photo'}</button>` : ''}
+        </div>`}
+        <div style="overflow-x:auto;" class="lt-scroll">
+        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <thead><tr style="color:${SUB};text-align:left;"><th style="padding:4px 6px;">Test</th><th style="padding:4px 6px;">Value</th><th style="padding:4px 6px;">Ref range</th><th style="padding:4px 6px;">Flag</th><th style="padding:4px 6px;"></th></tr></thead>
+          <tbody>
+          ${rs.map(r=>{
+            const cat = CATALOG.find(c=>c.id===r.testId);
+            const f = computeFlag(r); const fc = f==='H'?HIGH:f==='L'?LOW:SUB;
+            const isEditing = isEditor && editingResultId===r.id;
+            const editRow = isEditing ? `<tr style="border-top:1px solid ${LINE};background:${PAPER};"><td colspan="5" style="padding:8px 6px;">
+              <span style="font-size:11px;color:${SUB};margin-right:4px;">Value</span><input type="text" class="lt-edit-value lt-mono" data-result="${r.id}" value="${esc(r.valueRaw)}" style="width:80px;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-right:8px;"/>
+              <span style="font-size:11px;color:${SUB};margin-right:4px;">Unit</span><input type="text" class="lt-edit-unit" data-result="${r.id}" value="${esc(r.unit)}" style="width:80px;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-right:8px;"/>
+              <span style="font-size:11px;color:${SUB};margin-right:4px;">Ref low</span><input type="text" class="lt-edit-reflow lt-mono" data-result="${r.id}" value="${r.refLow!=null?r.refLow:''}" style="width:60px;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-right:8px;"/>
+              <span style="font-size:11px;color:${SUB};margin-right:4px;">Ref high</span><input type="text" class="lt-edit-refhigh lt-mono" data-result="${r.id}" value="${r.refHigh!=null?r.refHigh:''}" style="width:60px;padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-right:8px;"/>
+              <button class="lt-edit-confirm" data-result="${r.id}" style="background:${TEAL};color:#fff;border:none;padding:5px 10px;border-radius:5px;font-size:12px;margin-left:4px;">Save</button>
+              <button class="lt-edit-cancel" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-left:4px;">Cancel</button>
+            </td></tr>` : '';
+            return `<tr style="border-top:1px solid ${LINE};"><td style="padding:4px 6px;">${esc(cat?cat.name:r.rawLabel)}</td><td class="lt-mono" style="padding:4px 6px;color:${fc};">${esc(r.valueRaw)} ${esc(r.unit)}</td><td class="lt-mono" style="padding:4px 6px;color:${SUB};">${r.refLow!=null?r.refLow:''}${r.refLow!=null&&r.refHigh!=null?' - ':''}${r.refHigh!=null?r.refHigh:''}</td><td style="padding:4px 6px;color:${fc};">${f==='normal'?'':f}</td><td style="padding:4px 6px;">${isEditor ? `<button class="lt-edit-start" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};">Edit</button>` : ''}</td></tr>${editRow}`;
+          }).join('')}
+          </tbody>
+        </table>
+        </div>
+      </div>` : ''}
+    </div>`;
+  }
+  html += `</div>`;
+  return html;
+}
+
+function renderCatalogTab(){
+  let html = `<div style="max-width:800px;margin:0 auto;padding:20px 16px 60px;">
+    <div style="font-size:13px;color:${SUB};margin-bottom:16px;">Every distinct assay is tracked separately here, so similar-sounding tests (like different eGFR methods) never get merged. The reference range set here is the "usual" range the app compares each new report against -- when a report shows something different, you'll see it flagged in the review screen instead of having to notice it yourself.</div>
+    ${CATALOG.map(t=>`<div style="background:${CARD};border:1px solid ${LINE};border-radius:8px;padding:12px 14px;margin-bottom:8px;">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:8px;">
+        <div style="font-size:14px;font-weight:500;">${esc(t.name)}</div>
+        <div style="font-size:11px;color:${SUB};">${esc(t.unit)}</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 70px 70px;gap:8px;margin-bottom:8px;">
+        <label style="font-size:11px;color:${SUB};">Domain
+          <input type="text" class="lt-cat-domain" data-id="${t.id}" value="${esc(t.domain)}" ${isEditor?'':'disabled'} style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/>
+        </label>
+        <label style="font-size:11px;color:${SUB};">Subdomain
+          <input type="text" class="lt-cat-subdomain" data-id="${t.id}" value="${esc(t.subdomain)}" ${isEditor?'':'disabled'} style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/>
+        </label>
+        <label style="font-size:11px;color:${SUB};">Ref low
+          <input type="text" class="lt-cat-reflow lt-mono" data-id="${t.id}" value="${t.refLow!=null?t.refLow:''}" ${isEditor?'':'disabled'} style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/>
+        </label>
+        <label style="font-size:11px;color:${SUB};">Ref high
+          <input type="text" class="lt-cat-refhigh lt-mono" data-id="${t.id}" value="${t.refHigh!=null?t.refHigh:''}" ${isEditor?'':'disabled'} style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/>
+        </label>
+      </div>
+      <label style="font-size:11px;color:${SUB};display:block;margin-bottom:6px;">Range note (for tiered, age-dependent, or conditional ranges that don't fit a single low/high)
+        <input type="text" class="lt-cat-rangenote" data-id="${t.id}" value="${esc(t.rangeNote||'')}" placeholder="e.g. age-tiered threshold, not a flat range" ${isEditor?'':'disabled'} style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/>
+      </label>
+      <label style="font-size:11px;color:${SUB};display:block;margin-bottom:6px;">Tags (comma-separated -- lets a test surface under more than one topic, without changing its home domain)
+        <input type="text" class="lt-cat-tags" data-id="${t.id}" value="${(t.tags||[]).join(', ')}" placeholder="e.g. kidney, heart failure" ${isEditor?'':'disabled'} style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/>
+      </label>
+      <div style="font-size:11px;color:${SUB};">Also matches: ${t.aliases.map(a=>isEditor ? `<span class="lt-alias-chip" data-testid="${t.id}" data-alias="${esc(a)}" style="display:inline-block;background:${PAPER};border:1px solid ${LINE};border-radius:4px;padding:1px 6px;margin:2px 3px 0 0;cursor:pointer;" title="Click to remove this alias">${esc(a)} &times;</span>` : `<span style="display:inline-block;background:${PAPER};border:1px solid ${LINE};border-radius:4px;padding:1px 6px;margin:2px 3px 0 0;">${esc(a)}</span>`).join('')}</div>
+    </div>`).join('')}
+    <div style="font-size:12px;color:${SUB};margin-top:6px;">To fix a result that got matched to the wrong test, go to the Results tab, expand the test, and use "Move" on that row.</div>
+  </div>`;
+  return html;
+}
+
+function renderLogin(){
+  return `<div style="max-width:360px;margin:80px auto;padding:0 16px;">
+    <div class="lt-head" style="font-size:18px;font-weight:600;margin-bottom:4px;text-align:center;">Lab tracker</div>
+    <div style="font-size:13px;color:${SUB};margin-bottom:20px;text-align:center;">Sign in to view or add records.</div>
+    <div style="background:${CARD};border:1px solid ${LINE};border-radius:10px;padding:20px;">
+      <label style="font-size:12px;color:${SUB};display:block;margin-bottom:10px;">Email
+        <input type="email" id="lt-login-email" autocomplete="username" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+      </label>
+      <label style="font-size:12px;color:${SUB};display:block;margin-bottom:14px;">Password
+        <input type="password" id="lt-login-password" autocomplete="current-password" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+      </label>
+      <button id="lt-login-submit" style="width:100%;background:${TEAL};color:#fff;border:none;padding:10px;border-radius:8px;font-size:14px;font-weight:500;">${loggingIn ? 'Signing in...' : 'Sign in'}</button>
+      ${loginError ? `<div style="margin-top:10px;font-size:12px;color:${HIGH};">${esc(loginError)}</div>` : ''}
+    </div>
+  </div>`;
+}
+
+async function doLogin(){
+  const emailEl = root.querySelector('#lt-login-email');
+  const passEl = root.querySelector('#lt-login-password');
+  const email = emailEl ? emailEl.value.trim() : '';
+  const password = passEl ? passEl.value : '';
+  if(!email || !password){ loginError = 'Enter both email and password.'; render(); return; }
+  loggingIn = true; loginError = ''; render();
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  loggingIn = false;
+  if(error){ loginError = 'Could not sign in -- check the email and password.'; render(); return; }
+  session = data.session;
+  isEditor = (session.user.app_metadata||{}).role === 'editor';
+  await loadAll();
+}
+
+async function doLogout(){
+  await sb.auth.signOut();
+  session = null; isEditor = false;
+  CATALOG = []; ORDERS = []; RESULTS = []; loaded = false;
+  render();
+}
+
+function renderTopBar(){
+  const roleLabel = isEditor ? 'Editor' : 'Viewer';
+  return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid ${LINE};background:${CARD};">
+    <div class="lt-head" style="font-size:14px;font-weight:600;">Lab tracker</div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span style="font-size:11px;color:${SUB};background:${PAPER};padding:2px 8px;border-radius:4px;">${roleLabel}</span>
+      <button id="lt-logout" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:6px;font-size:12px;color:${INK};">Sign out</button>
+    </div>
+  </div>`;
+}
+
+function render(){
+  if(!session){ root.innerHTML = renderLogin(); wireEvents(); return; }
+  if(!loaded){ root.innerHTML = renderTopBar() + `<div style="padding:40px;text-align:center;color:${SUB};font-size:14px;">Loading...</div>`; return; }
+  if(activeTab==='add' && !isEditor) activeTab = 'results';
+  let body = activeTab==='add' ? renderAddTab() : activeTab==='results' ? renderResultsTab() : activeTab==='reports' ? renderReportsTab() : renderCatalogTab();
+  root.innerHTML = renderTopBar() + `
+    <div style="border-bottom:1px solid ${LINE};padding:0 4px;display:flex;gap:4px;">
+      ${isEditor ? tabBtn('add','Add report') : ''}
+      ${tabBtn('results','Results')}
+      ${tabBtn('reports','Lab reports')}
+      ${tabBtn('catalog','Test catalog')}
+    </div>
+    ${body}
+    ${renderLightbox()}
+  `;
+  wireEvents();
+}
+
+function wireEvents(){
+  const loginBtn = root.querySelector('#lt-login-submit');
+  if(loginBtn) loginBtn.onclick = doLogin;
+  const loginPass = root.querySelector('#lt-login-password');
+  if(loginPass) loginPass.onkeydown = (e)=>{ if(e.key==='Enter') doLogin(); };
+  const logoutBtn = root.querySelector('#lt-logout');
+  if(logoutBtn) logoutBtn.onclick = doLogout;
+  if(!session) return;
+
+  root.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{ activeTab=b.getAttribute('data-tab'); render(); });
+
+  const uploadBtn = root.querySelector('#lt-upload-btn');
+  const fileInput = root.querySelector('#lt-file-input');
+  if(uploadBtn && fileInput){
+    uploadBtn.onclick = ()=> fileInput.click();
+    fileInput.onchange = (e)=>{ const f = e.target.files[0]; if(f) extractFromImage(f); };
+  }
+  const manualBtn = root.querySelector('#lt-manual-btn');
+  if(manualBtn) manualBtn.onclick = startManualEntry;
+  const pasteBtn = root.querySelector('#lt-paste-import');
+  if(pasteBtn) pasteBtn.onclick = ()=> importPastedJson(false);
+
+  const metaDate = root.querySelector('#lt-meta-date');
+  if(metaDate) metaDate.onchange = e=>{ pendingExtraction.reportDate = e.target.value; };
+  const metaPhys = root.querySelector('#lt-meta-phys');
+  if(metaPhys) metaPhys.onchange = e=>{ pendingExtraction.orderingPhysician = e.target.value; };
+  const metaFac = root.querySelector('#lt-meta-facility');
+  if(metaFac) metaFac.onchange = e=>{ pendingExtraction.facility = e.target.value; };
+  const metaSourceNotes = root.querySelector('#lt-meta-source-notes');
+  if(metaSourceNotes) metaSourceNotes.onchange = e=>{ pendingExtraction.sourceNotes = e.target.value; };
+  const metaContextNotes = root.querySelector('#lt-meta-context-notes');
+  if(metaContextNotes) metaContextNotes.onchange = e=>{ pendingExtraction.contextNotes = e.target.value; };
+
+  root.querySelectorAll('tr[data-row]').forEach(tr=>{
+    const rowId = tr.getAttribute('data-row');
+    const row = pendingExtraction.rows.find(r=>r.rowId===rowId);
+    const inc = tr.querySelector('.lt-row-include'); if(inc) inc.onchange = e=>{ row.include = e.target.checked; };
+    const lbl = tr.querySelector('.lt-row-label'); if(lbl) lbl.oninput = e=>{ row.rawLabel = e.target.value; };
+    const match = tr.querySelector('.lt-row-match'); if(match) match.onchange = e=>{ row.matchedTestId = e.target.value; render(); };
+    const val = tr.querySelector('.lt-row-value'); if(val) val.oninput = e=>{ row.value = e.target.value; };
+    const unit = tr.querySelector('.lt-row-unit'); if(unit) unit.oninput = e=>{ row.unit = e.target.value; };
+    const rl = tr.querySelector('.lt-row-reflow'); if(rl) rl.oninput = e=>{ row.refLow = e.target.value; };
+    const rh = tr.querySelector('.lt-row-refhigh'); if(rh) rh.oninput = e=>{ row.refHigh = e.target.value; };
+    const rm = tr.querySelector('.lt-row-remove'); if(rm) rm.onclick = ()=>{ pendingExtraction.rows = pendingExtraction.rows.filter(r=>r.rowId!==rowId); render(); };
+  });
+  const addRowBtn = root.querySelector('#lt-add-row'); if(addRowBtn) addRowBtn.onclick = addBlankRow;
+  const uploadAppendBtn = root.querySelector('#lt-upload-append-btn');
+  const fileInputAppend = root.querySelector('#lt-file-input-append');
+  if(uploadAppendBtn && fileInputAppend){
+    uploadAppendBtn.onclick = ()=> fileInputAppend.click();
+    fileInputAppend.onchange = (e)=>{ const f = e.target.files[0]; if(f) extractFromImage(f, true); };
+  }
+  const pasteAppendBtn = root.querySelector('#lt-paste-import-append');
+  if(pasteAppendBtn) pasteAppendBtn.onclick = ()=>{
+    const el = root.querySelector('#lt-paste-json-append');
+    const raw = el ? el.value.trim() : '';
+    if(!raw) return;
+    try {
+      const parsed = JSON.parse(raw.replace(/```json|```/g,'').trim());
+      pendingExtraction.rows = pendingExtraction.rows.concat(buildRowsFromParsed(parsed));
+      render();
+    } catch(e){ extractError = 'IMPORT:That did not look like valid extracted data.'; render(); }
+  };
+  const saveBtn = root.querySelector('#lt-save-extraction'); if(saveBtn) saveBtn.onclick = saveExtraction;
+  const cancelBtn = root.querySelector('#lt-cancel-extraction'); if(cancelBtn) cancelBtn.onclick = cancelExtraction;
+
+  root.querySelectorAll('.lt-test-row').forEach(el=>{
+    el.onclick = ()=>{ const id = el.getAttribute('data-test'); expandedTest = expandedTest===id ? null : id; movingResultId = null; editingResultId = null; render(); };
+  });
+  root.querySelectorAll('.lt-move-start').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); movingResultId = el.getAttribute('data-result'); editingResultId = null; render(); };
+  });
+  root.querySelectorAll('.lt-move-cancel').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); movingResultId = null; render(); };
+  });
+  root.querySelectorAll('.lt-move-confirm').forEach(el=>{
+    el.onclick = (e)=>{
+      e.stopPropagation();
+      const resultId = el.getAttribute('data-result');
+      const sel = root.querySelector(`.lt-move-select[data-result="${resultId}"]`);
+      if(sel) moveResult(resultId, sel.value);
+    };
+  });
+  root.querySelectorAll('.lt-edit-start').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); editingResultId = el.getAttribute('data-result'); movingResultId = null; render(); };
+  });
+  root.querySelectorAll('.lt-edit-cancel').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); editingResultId = null; render(); };
+  });
+  root.querySelectorAll('.lt-edit-confirm').forEach(el=>{
+    el.onclick = (e)=>{
+      e.stopPropagation();
+      const resultId = el.getAttribute('data-result');
+      const v = root.querySelector(`.lt-edit-value[data-result="${resultId}"]`);
+      const u = root.querySelector(`.lt-edit-unit[data-result="${resultId}"]`);
+      const rl = root.querySelector(`.lt-edit-reflow[data-result="${resultId}"]`);
+      const rh = root.querySelector(`.lt-edit-refhigh[data-result="${resultId}"]`);
+      if(v) editResult(resultId, v.value, u?u.value:'', rl?rl.value:'', rh?rh.value:'');
+    };
+  });
+
+  root.querySelectorAll('.lt-cat-domain').forEach(el=>{
+    el.onchange = e=>{ const t = CATALOG.find(c=>c.id===el.getAttribute('data-id')); if(t){ t.domain = e.target.value; saveCatalog(); } };
+  });
+  root.querySelectorAll('.lt-cat-subdomain').forEach(el=>{
+    el.onchange = e=>{ const t = CATALOG.find(c=>c.id===el.getAttribute('data-id')); if(t){ t.subdomain = e.target.value; saveCatalog(); } };
+  });
+  root.querySelectorAll('.lt-cat-reflow').forEach(el=>{
+    el.onchange = e=>{ const t = CATALOG.find(c=>c.id===el.getAttribute('data-id')); if(t){ t.refLow = e.target.value===''? null : parseFloat(e.target.value); saveCatalog(); } };
+  });
+  root.querySelectorAll('.lt-cat-refhigh').forEach(el=>{
+    el.onchange = e=>{ const t = CATALOG.find(c=>c.id===el.getAttribute('data-id')); if(t){ t.refHigh = e.target.value===''? null : parseFloat(e.target.value); saveCatalog(); } };
+  });
+  root.querySelectorAll('.lt-cat-rangenote').forEach(el=>{
+    el.onchange = e=>{ const t = CATALOG.find(c=>c.id===el.getAttribute('data-id')); if(t){ t.rangeNote = e.target.value; saveCatalog(); } };
+  });
+  root.querySelectorAll('.lt-cat-tags').forEach(el=>{
+    el.onchange = e=>{ const t = CATALOG.find(c=>c.id===el.getAttribute('data-id')); if(t){ t.tags = e.target.value.split(',').map(s=>s.trim()).filter(Boolean); saveCatalog(); } };
+  });
+  root.querySelectorAll('.lt-alias-chip').forEach(el=>{
+    el.onclick = ()=>{
+      const t = CATALOG.find(c=>c.id===el.getAttribute('data-testid'));
+      const alias = el.getAttribute('data-alias');
+      if(t){
+        t.aliases = t.aliases.filter(a=>a!==alias);
+        saveCatalog(); render();
+      }
+    };
+  });
+
+  root.querySelectorAll('.lt-goto-order').forEach(el=>{
+    el.onclick = (e)=>{ e.preventDefault(); activeTab='reports'; expandedOrder = el.getAttribute('data-order'); render(); };
+  });
+  root.querySelectorAll('.lt-goto-source').forEach(el=>{
+    el.onclick = (e)=>{ e.preventDefault(); const orderId = el.getAttribute('data-order'); const count = parseInt(el.getAttribute('data-count'))||0; openLightboxForOrder(orderId, count); };
+  });
+
+  root.querySelectorAll('.lt-order-row').forEach(el=>{
+    el.onclick = ()=>{ const id = el.getAttribute('data-order'); expandedOrder = expandedOrder===id ? null : id; editingOrderId = null; editingResultId = null; render(); };
+  });
+  root.querySelectorAll('.lt-order-edit-start').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); editingOrderId = el.getAttribute('data-order'); render(); };
+  });
+  root.querySelectorAll('.lt-order-edit-cancel').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); editingOrderId = null; render(); };
+  });
+  root.querySelectorAll('.lt-order-edit-save').forEach(el=>{
+    el.onclick = (e)=>{
+      e.stopPropagation();
+      const orderId = el.getAttribute('data-order');
+      const d = root.querySelector(`.lt-order-edit-date[data-order="${orderId}"]`);
+      const p = root.querySelector(`.lt-order-edit-phys[data-order="${orderId}"]`);
+      const f = root.querySelector(`.lt-order-edit-facility[data-order="${orderId}"]`);
+      const sn = root.querySelector(`.lt-order-edit-source[data-order="${orderId}"]`);
+      const cn = root.querySelector(`.lt-order-edit-context[data-order="${orderId}"]`);
+      editOrder(orderId, d?d.value:'', p?p.value:'', f?f.value:'', sn?sn.value:'', cn?cn.value:'');
+    };
+  });
+  root.querySelectorAll('.lt-order-view-photo').forEach(el=>{
+    el.onclick = (e)=>{
+      e.stopPropagation();
+      const orderId = el.getAttribute('data-order');
+      const count = parseInt(el.getAttribute('data-count'))||0;
+      if(!count){ lightboxPhotos = ['__none__']; render(); return; }
+      openLightboxForOrder(orderId, count);
+    };
+  });
+  root.querySelectorAll('.lt-order-attach-btn').forEach(el=>{
+    el.onclick = (e)=>{
+      e.stopPropagation();
+      const orderId = el.getAttribute('data-order');
+      const input = root.querySelector(`.lt-order-attach-input[data-order="${orderId}"]`);
+      if(input) input.click();
+    };
+  });
+  root.querySelectorAll('.lt-order-attach-input').forEach(el=>{
+    el.onclick = (e)=> e.stopPropagation();
+    el.onchange = (e)=>{
+      const orderId = el.getAttribute('data-order');
+      const file = e.target.files[0];
+      if(file) attachPhotoToOrder(orderId, file);
+    };
+  });
+  const lbClose = root.querySelector('#lt-lightbox-close');
+  if(lbClose) lbClose.onclick = ()=>{ lightboxPhotos = null; render(); };
+  const lbPrev = root.querySelector('#lt-lightbox-prev');
+  if(lbPrev) lbPrev.onclick = ()=>{ lightboxIndex = (lightboxIndex - 1 + lightboxPhotos.length) % lightboxPhotos.length; render(); };
+  const lbNext = root.querySelector('#lt-lightbox-next');
+  if(lbNext) lbNext.onclick = ()=>{ lightboxIndex = (lightboxIndex + 1) % lightboxPhotos.length; render(); };
+}
+
+(async function bootstrap(){
+  const { data } = await sb.auth.getSession();
+  if(data && data.session){
+    session = data.session;
+    isEditor = (session.user.app_metadata||{}).role === 'editor';
+    await loadAll();
+  } else {
+    render();
+  }
+})();
+})();
+</script>
+</body>
+</html>
