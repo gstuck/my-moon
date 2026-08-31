@@ -191,8 +191,8 @@ const DEFAULT_CATALOG = [
 
 function catalogToDb(t){ return { id:t.id, name:t.name, aliases:t.aliases||[], domain:t.domain, subdomain:t.subdomain, unit:t.unit||'', ref_low:t.refLow, ref_high:t.refHigh, range_note:t.rangeNote||'', tags:t.tags||[] }; }
 function catalogFromDb(r){ return { id:r.id, name:r.name, aliases:r.aliases||[], domain:r.domain, subdomain:r.subdomain, unit:r.unit||'', refLow:r.ref_low, refHigh:r.ref_high, rangeNote:r.range_note||'', tags:r.tags||[] }; }
-function orderToDb(o){ return { id:o.id, date:o.date, ordering_physician:o.orderingPhysician||'', facility:o.facility||'', source_notes:o.sourceNotes||'', context_notes:o.contextNotes||'', photo_count:o.photoCount||0, created_at:o.createdAt||new Date().toISOString() }; }
-function orderFromDb(r){ return { id:r.id, date:r.date, orderingPhysician:r.ordering_physician||'', facility:r.facility||'', sourceNotes:r.source_notes||'', contextNotes:r.context_notes||'', photoCount:r.photo_count||0, createdAt:r.created_at }; }
+function orderToDb(o){ return { id:o.id, date:o.date, reported_date:o.reportedDate||null, ordering_physician:o.orderingPhysician||'', facility:o.facility||'', source_notes:o.sourceNotes||'', context_notes:o.contextNotes||'', photo_count:o.photoCount||0, created_at:o.createdAt||new Date().toISOString() }; }
+function orderFromDb(r){ return { id:r.id, date:r.date, reportedDate:r.reported_date||'', orderingPhysician:r.ordering_physician||'', facility:r.facility||'', sourceNotes:r.source_notes||'', contextNotes:r.context_notes||'', photoCount:r.photo_count||0, createdAt:r.created_at }; }
 function resultToDb(r){ return { id:r.id, order_id:r.orderId, test_id:r.testId, raw_label:r.rawLabel||'', value:(r.value==null||isNaN(r.value))?null:r.value, value_raw:r.valueRaw||'', unit:r.unit||'', ref_low:r.refLow, ref_high:r.refHigh, flag:r.flag||'', hidden:!!r.hidden }; }
 function resultFromDb(r){ return { id:r.id, orderId:r.order_id, testId:r.test_id, rawLabel:r.raw_label||'', value:r.value, valueRaw:r.value_raw||'', unit:r.unit||'', refLow:r.ref_low, refHigh:r.ref_high, flag:r.flag||'', hidden:!!r.hidden }; }
 
@@ -356,7 +356,8 @@ async function extractFromImage(rawFile, appendMode){
       if(thumbDataUrl) pendingExtraction.photos.push(thumbDataUrl);
     } else {
       pendingExtraction = {
-        reportDate: parsed.reportDate || '',
+        reportDate: parsed.collectedDate || parsed.reportDate || '',
+        reportedDate: parsed.reportedDate || '',
         orderingPhysician: parsed.orderingPhysician || '',
         facility: parsed.facility || '',
         sourceNotes: parsed.notes || '',
@@ -411,7 +412,8 @@ function importPastedJson(appendMode){
       pendingExtraction.rows = pendingExtraction.rows.concat(newRows);
     } else {
       pendingExtraction = {
-        reportDate: parsed.reportDate || '',
+        reportDate: parsed.collectedDate || parsed.reportDate || '',
+        reportedDate: parsed.reportedDate || '',
         orderingPhysician: parsed.orderingPhysician || '',
         facility: parsed.facility || '',
         sourceNotes: parsed.notes || '',
@@ -443,6 +445,7 @@ async function saveExtraction(){
   ORDERS.push({
     id: orderId,
     date: pendingExtraction.reportDate || new Date().toISOString().slice(0,10),
+    reportedDate: pendingExtraction.reportedDate || '',
     orderingPhysician: pendingExtraction.orderingPhysician || '',
     facility: pendingExtraction.facility || '',
     sourceNotes: pendingExtraction.sourceNotes || '',
@@ -540,9 +543,12 @@ function renderAddTab(){
     const p = pendingExtraction;
     html += `<div style="max-width:900px;margin:0 auto;padding:24px 16px 60px;">
       <div class="lt-head" style="font-size:18px;font-weight:600;margin-bottom:16px;">Review report</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;">
-        <label style="font-size:12px;color:${SUB};">Report date
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:10px;">
+        <label style="font-size:12px;color:${SUB};">Collected date
           <input type="date" id="lt-meta-date" value="${esc(p.reportDate)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Reported date (optional)
+          <input type="date" id="lt-meta-reported-date" value="${esc(p.reportedDate||'')}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
         </label>
         <label style="font-size:12px;color:${SUB};">Ordering physician
           <input type="text" id="lt-meta-phys" value="${esc(p.orderingPhysician)}" placeholder="Dr. name" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
@@ -645,11 +651,12 @@ function renderResultsTab(){
     byDomain[t.domain][t.subdomain].push(t);
   }
   let html = `<div style="max-width:1000px;margin:0 auto;padding:20px 16px 60px;">`;
-  for(const domain of Object.keys(byDomain)){
+  const sortAlnum = (a,b)=> a.localeCompare(b, undefined, {numeric:true, sensitivity:'base'});
+  for(const domain of Object.keys(byDomain).sort(sortAlnum)){
     html += `<div class="lt-head" style="font-size:15px;font-weight:600;margin:22px 0 8px;">${esc(domain)}</div>`;
-    for(const subdomain of Object.keys(byDomain[domain])){
+    for(const subdomain of Object.keys(byDomain[domain]).sort(sortAlnum)){
       html += `<div style="font-size:12px;color:${SUB};text-transform:uppercase;letter-spacing:0.03em;margin:10px 0 6px;">${esc(subdomain)}</div>`;
-      for(const t of byDomain[domain][subdomain]){
+      for(const t of byDomain[domain][subdomain].slice().sort((a,b)=>a.name.localeCompare(b.name))){
         const rsAll = RESULTS.filter(r=>r.testId===t.id).map(r=>({...r, order: orderById[r.orderId]})).sort((a,b)=>(a.order?.date||'').localeCompare(b.order?.date||''));
         const rsVisible = rsAll.filter(r=>!r.hidden);
         const hiddenCount = rsAll.length - rsVisible.length;
@@ -720,7 +727,7 @@ function renderResultsTab(){
   return html;
 }
 
-function editOrder(orderId, date, physician, facility, sourceNotes, contextNotes){
+function editOrder(orderId, date, physician, facility, sourceNotes, contextNotes, reportedDate){
   const o = ORDERS.find(x=>x.id===orderId);
   if(!o) return;
   o.date = date || o.date;
@@ -728,8 +735,31 @@ function editOrder(orderId, date, physician, facility, sourceNotes, contextNotes
   o.facility = facility || '';
   o.sourceNotes = sourceNotes || '';
   o.contextNotes = contextNotes || '';
+  o.reportedDate = reportedDate || '';
   saveOrders();
   editingOrderId = null;
+  render();
+}
+
+let deletingOrderId = null;
+
+async function deleteOrder(orderId){
+  const o = ORDERS.find(x=>x.id===orderId);
+  if(!o) return;
+  try {
+    if(o.photoCount){
+      const paths = [];
+      for(let i=0;i<o.photoCount;i++) paths.push(orderId+'/'+i+'.jpg');
+      const { error: storageError } = await sb.storage.from('lab-photos').remove(paths);
+      if(storageError) console.error('photo cleanup failed', storageError);
+    }
+    const { error } = await sb.from('orders').delete().eq('id', orderId);
+    if(error){ console.error('deleteOrder error', error); return; }
+  } catch(e){ console.error('deleteOrder failed', e); return; }
+  ORDERS = ORDERS.filter(x=>x.id!==orderId);
+  RESULTS = RESULTS.filter(x=>x.orderId!==orderId);
+  deletingOrderId = null;
+  expandedOrder = null;
   render();
 }
 
@@ -811,14 +841,15 @@ function renderReportsTab(){
       <div class="lt-order-row" data-order="${o.id}" style="display:flex;align-items:center;gap:14px;padding:12px 14px;cursor:pointer;">
         <div style="flex:1;min-width:0;">
           <div class="lt-mono" style="font-size:14px;font-weight:500;">${esc(o.date)}</div>
-          <div style="font-size:11px;color:${SUB};">${esc(o.orderingPhysician||'Physician not recorded')}${o.facility?' &middot; '+esc(o.facility):''} &middot; ${rs.length} result${rs.length!==1?'s':''}</div>
+          <div style="font-size:11px;color:${SUB};">${esc(o.orderingPhysician||'Physician not recorded')}${o.facility?' &middot; '+esc(o.facility):''} &middot; ${rs.length} result${rs.length!==1?'s':''}${o.reportedDate?' &middot; reported '+esc(o.reportedDate):''}</div>
         </div>
         <div style="font-size:11px;color:${SUB};">${o.photoCount?o.photoCount+' photo'+(o.photoCount>1?'s':''):'no photo'}</div>
       </div>
       ${isOpen ? `<div style="border-top:1px solid ${LINE};padding:12px 14px;">
         ${isEditingOrder ? `<div style="background:${PAPER};border-radius:6px;padding:10px;margin-bottom:10px;">
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
-            <label style="font-size:11px;color:${SUB};">Date<input type="date" class="lt-order-edit-date" data-order="${o.id}" value="${esc(o.date)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
+            <label style="font-size:11px;color:${SUB};">Collected date<input type="date" class="lt-order-edit-date" data-order="${o.id}" value="${esc(o.date)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Reported date<input type="date" class="lt-order-edit-reported" data-order="${o.id}" value="${esc(o.reportedDate||'')}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
             <label style="font-size:11px;color:${SUB};">Physician<input type="text" class="lt-order-edit-phys" data-order="${o.id}" value="${esc(o.orderingPhysician)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
             <label style="font-size:11px;color:${SUB};">Facility<input type="text" class="lt-order-edit-facility" data-order="${o.id}" value="${esc(o.facility)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
           </div>
@@ -834,8 +865,14 @@ function renderReportsTab(){
           <button class="lt-order-view-photo" data-order="${o.id}" data-count="${o.photoCount||0}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-right:6px;">${o.photoCount?'View source photo':'No photo attached'}</button>
           ${isEditor ? `<button class="lt-order-edit-start" data-order="${o.id}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-right:6px;">Edit details</button>
           <input type="file" accept="image/*,.heic,.heif" class="lt-order-attach-input" data-order="${o.id}" style="display:none"/>
-          <button class="lt-order-attach-btn" data-order="${o.id}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;">${o.photoCount?'Add another photo':'Attach photo'}</button>` : ''}
+          <button class="lt-order-attach-btn" data-order="${o.id}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-right:6px;">${o.photoCount?'Add another photo':'Attach photo'}</button>
+          <button class="lt-order-delete-start" data-order="${o.id}" style="background:none;border:1px solid ${HIGH};padding:5px 10px;border-radius:5px;font-size:12px;color:${HIGH};">Delete report</button>` : ''}
         </div>`}
+        ${deletingOrderId===o.id ? `<div style="background:${HIGH_BG};border-radius:6px;padding:10px;margin-bottom:10px;">
+          <span style="font-size:12px;color:${HIGH};margin-right:8px;">Permanently delete this entire report and all ${rs.length} result${rs.length!==1?'s':''} in it? This can't be undone.</span>
+          <button class="lt-order-delete-confirm" data-order="${o.id}" style="background:${HIGH};color:#fff;border:none;padding:5px 10px;border-radius:5px;font-size:12px;margin-right:4px;">Delete permanently</button>
+          <button class="lt-order-delete-cancel" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;">Cancel</button>
+        </div>` : ''}
         <div style="overflow-x:auto;" class="lt-scroll">
         <table style="width:100%;border-collapse:collapse;font-size:12px;">
           <thead><tr style="color:${SUB};text-align:left;"><th style="padding:4px 6px;">Test</th><th style="padding:4px 6px;">Value</th><th style="padding:4px 6px;">Ref range</th><th style="padding:4px 6px;">Flag</th><th style="padding:4px 6px;"></th></tr></thead>
@@ -867,8 +904,7 @@ function renderReportsTab(){
 function renderCatalogTab(){
   let html = `<div style="max-width:800px;margin:0 auto;padding:20px 16px 60px;">
     <div style="font-size:13px;color:${SUB};margin-bottom:16px;">Every distinct assay is tracked separately here, so similar-sounding tests (like different eGFR methods) never get merged. The reference range set here is the "usual" range the app compares each new report against -- when a report shows something different, you'll see it flagged in the review screen instead of having to notice it yourself.</div>
-    ${CATALOG.map(t=>`<div style="background:${CARD};border:1px solid ${LINE};border-radius:8px;padding:12px 14px;margin-bottom:8px;">
-      <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:8px;">
+    ${CATALOG.slice().sort((a,b)=>a.name.localeCompare(b.name)).map(t=>`<div style="background:${CARD};border:1px solid ${LINE};border-radius:8px;padding:12px 14px;margin-bottom:8px;">      <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:8px;">
         <div style="font-size:14px;font-weight:500;">${esc(t.name)}</div>
         <div style="font-size:11px;color:${SUB};">${esc(t.unit)}</div>
       </div>
@@ -991,6 +1027,8 @@ function wireEvents(){
 
   const metaDate = root.querySelector('#lt-meta-date');
   if(metaDate) metaDate.onchange = e=>{ pendingExtraction.reportDate = e.target.value; };
+  const metaReportedDate = root.querySelector('#lt-meta-reported-date');
+  if(metaReportedDate) metaReportedDate.onchange = e=>{ pendingExtraction.reportedDate = e.target.value; };
   const metaPhys = root.querySelector('#lt-meta-phys');
   if(metaPhys) metaPhys.onchange = e=>{ pendingExtraction.orderingPhysician = e.target.value; };
   const metaFac = root.querySelector('#lt-meta-facility');
@@ -1129,7 +1167,7 @@ function wireEvents(){
   });
 
   root.querySelectorAll('.lt-order-row').forEach(el=>{
-    el.onclick = ()=>{ const id = el.getAttribute('data-order'); expandedOrder = expandedOrder===id ? null : id; editingOrderId = null; editingResultId = null; render(); };
+    el.onclick = ()=>{ const id = el.getAttribute('data-order'); expandedOrder = expandedOrder===id ? null : id; editingOrderId = null; editingResultId = null; deletingOrderId = null; render(); };
   });
   root.querySelectorAll('.lt-order-edit-start').forEach(el=>{
     el.onclick = (e)=>{ e.stopPropagation(); editingOrderId = el.getAttribute('data-order'); render(); };
@@ -1142,12 +1180,22 @@ function wireEvents(){
       e.stopPropagation();
       const orderId = el.getAttribute('data-order');
       const d = root.querySelector(`.lt-order-edit-date[data-order="${orderId}"]`);
+      const rd = root.querySelector(`.lt-order-edit-reported[data-order="${orderId}"]`);
       const p = root.querySelector(`.lt-order-edit-phys[data-order="${orderId}"]`);
       const f = root.querySelector(`.lt-order-edit-facility[data-order="${orderId}"]`);
       const sn = root.querySelector(`.lt-order-edit-source[data-order="${orderId}"]`);
       const cn = root.querySelector(`.lt-order-edit-context[data-order="${orderId}"]`);
-      editOrder(orderId, d?d.value:'', p?p.value:'', f?f.value:'', sn?sn.value:'', cn?cn.value:'');
+      editOrder(orderId, d?d.value:'', p?p.value:'', f?f.value:'', sn?sn.value:'', cn?cn.value:'', rd?rd.value:'');
     };
+  });
+  root.querySelectorAll('.lt-order-delete-start').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); deletingOrderId = el.getAttribute('data-order'); render(); };
+  });
+  root.querySelectorAll('.lt-order-delete-cancel').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); deletingOrderId = null; render(); };
+  });
+  root.querySelectorAll('.lt-order-delete-confirm').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); deleteOrder(el.getAttribute('data-order')); };
   });
   root.querySelectorAll('.lt-order-view-photo').forEach(el=>{
     el.onclick = (e)=>{
