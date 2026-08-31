@@ -47,6 +47,9 @@ let extracting = false;
 let extractError = '';
 let expandedTest = null;
 let movingResultId = null;
+let deletingResultId = null;
+let showHiddenTests = new Set();
+let showHiddenInOrders = new Set();
 let editingResultId = null;
 let editingOrderId = null;
 let expandedOrder = null;
@@ -138,6 +141,27 @@ function moveResult(resultId, targetTestId){
   render();
 }
 
+async function hideResult(resultId, hidden){
+  const r = RESULTS.find(x=>x.id===resultId);
+  if(!r) return;
+  r.hidden = hidden;
+  try {
+    const { error } = await sb.from('results').update({ hidden }).eq('id', resultId);
+    if(error) console.error('hideResult error', error);
+  } catch(e){ console.error('hideResult failed', e); }
+  render();
+}
+
+async function deleteResult(resultId){
+  try {
+    const { error } = await sb.from('results').delete().eq('id', resultId);
+    if(error){ console.error('deleteResult error', error); return; }
+    RESULTS = RESULTS.filter(x=>x.id!==resultId);
+  } catch(e){ console.error('deleteResult failed', e); return; }
+  deletingResultId = null;
+  render();
+}
+
 function editResult(resultId, newValue, newUnit, newRefLow, newRefHigh){
   const r = RESULTS.find(x=>x.id===resultId);
   if(!r) return;
@@ -169,8 +193,8 @@ function catalogToDb(t){ return { id:t.id, name:t.name, aliases:t.aliases||[], d
 function catalogFromDb(r){ return { id:r.id, name:r.name, aliases:r.aliases||[], domain:r.domain, subdomain:r.subdomain, unit:r.unit||'', refLow:r.ref_low, refHigh:r.ref_high, rangeNote:r.range_note||'', tags:r.tags||[] }; }
 function orderToDb(o){ return { id:o.id, date:o.date, ordering_physician:o.orderingPhysician||'', facility:o.facility||'', source_notes:o.sourceNotes||'', context_notes:o.contextNotes||'', photo_count:o.photoCount||0, created_at:o.createdAt||new Date().toISOString() }; }
 function orderFromDb(r){ return { id:r.id, date:r.date, orderingPhysician:r.ordering_physician||'', facility:r.facility||'', sourceNotes:r.source_notes||'', contextNotes:r.context_notes||'', photoCount:r.photo_count||0, createdAt:r.created_at }; }
-function resultToDb(r){ return { id:r.id, order_id:r.orderId, test_id:r.testId, raw_label:r.rawLabel||'', value:(r.value==null||isNaN(r.value))?null:r.value, value_raw:r.valueRaw||'', unit:r.unit||'', ref_low:r.refLow, ref_high:r.refHigh, flag:r.flag||'' }; }
-function resultFromDb(r){ return { id:r.id, orderId:r.order_id, testId:r.test_id, rawLabel:r.raw_label||'', value:r.value, valueRaw:r.value_raw||'', unit:r.unit||'', refLow:r.ref_low, refHigh:r.ref_high, flag:r.flag||'' }; }
+function resultToDb(r){ return { id:r.id, order_id:r.orderId, test_id:r.testId, raw_label:r.rawLabel||'', value:(r.value==null||isNaN(r.value))?null:r.value, value_raw:r.valueRaw||'', unit:r.unit||'', ref_low:r.refLow, ref_high:r.refHigh, flag:r.flag||'', hidden:!!r.hidden }; }
+function resultFromDb(r){ return { id:r.id, orderId:r.order_id, testId:r.test_id, rawLabel:r.raw_label||'', value:r.value, valueRaw:r.value_raw||'', unit:r.unit||'', refLow:r.ref_low, refHigh:r.ref_high, flag:r.flag||'', hidden:!!r.hidden }; }
 
 async function loadAll(){
   try {
@@ -626,30 +650,38 @@ function renderResultsTab(){
     for(const subdomain of Object.keys(byDomain[domain])){
       html += `<div style="font-size:12px;color:${SUB};text-transform:uppercase;letter-spacing:0.03em;margin:10px 0 6px;">${esc(subdomain)}</div>`;
       for(const t of byDomain[domain][subdomain]){
-        const rs = RESULTS.filter(r=>r.testId===t.id).map(r=>({...r, order: orderById[r.orderId]})).sort((a,b)=>(a.order?.date||'').localeCompare(b.order?.date||''));
+        const rsAll = RESULTS.filter(r=>r.testId===t.id).map(r=>({...r, order: orderById[r.orderId]})).sort((a,b)=>(a.order?.date||'').localeCompare(b.order?.date||''));
+        const rsVisible = rsAll.filter(r=>!r.hidden);
+        const hiddenCount = rsAll.length - rsVisible.length;
+        const showHidden = showHiddenTests.has(t.id);
+        const rs = rsVisible.length ? rsVisible : rsAll;
         const latest = rs[rs.length-1];
         const latestFlag = computeFlag(latest);
         const flagColor = latestFlag==='H'?HIGH:latestFlag==='L'?LOW:INK;
         const spark = sparkline(rs.map(r=>({value:r.value, flag:computeFlag(r)})));
         const isOpen = expandedTest===t.id;
+        const detailRows = showHidden ? rsAll : rsVisible;
         html += `<div style="background:${CARD};border:1px solid ${LINE};border-radius:8px;margin-bottom:6px;overflow:hidden;">
           <div class="lt-test-row" data-test="${t.id}" style="display:flex;align-items:center;gap:14px;padding:10px 14px;cursor:pointer;">
             <div style="flex:1;min-width:0;">
               <div style="font-size:13px;font-weight:500;">${esc(t.name)}</div>
-              <div style="font-size:11px;color:${SUB};">${rs.length} result${rs.length>1?'s':''}${t.unit?' &middot; '+esc(t.unit):''}${(t.refLow!=null||t.refHigh!=null)?' &middot; usual range '+(t.refLow!=null?t.refLow:'')+((t.refLow!=null&&t.refHigh!=null)?'-':'')+(t.refHigh!=null?t.refHigh:''):''}${t.rangeNote?' &middot; <span title="'+esc(t.rangeNote)+'" style="text-decoration:underline dotted;">tiered range</span>':''}${(t.tags&&t.tags.length)?' &middot; '+t.tags.map(g=>`<span style="background:${PAPER};border:1px solid ${LINE};border-radius:3px;padding:0 4px;margin-right:3px;">${esc(g)}</span>`).join(''):''}</div>
+              <div style="font-size:11px;color:${SUB};">${rs.length} result${rs.length>1?'s':''}${hiddenCount?' &middot; '+hiddenCount+' hidden':''}${t.unit?' &middot; '+esc(t.unit):''}${(t.refLow!=null||t.refHigh!=null)?' &middot; usual range '+(t.refLow!=null?t.refLow:'')+((t.refLow!=null&&t.refHigh!=null)?'-':'')+(t.refHigh!=null?t.refHigh:''):''}${t.rangeNote?' &middot; <span title="'+esc(t.rangeNote)+'" style="text-decoration:underline dotted;">tiered range</span>':''}${(t.tags&&t.tags.length)?' &middot; '+t.tags.map(g=>`<span style="background:${PAPER};border:1px solid ${LINE};border-radius:3px;padding:0 4px;margin-right:3px;">${esc(g)}</span>`).join(''):''}</div>
             </div>
             <div>${spark}</div>
             <div class="lt-mono" style="min-width:70px;text-align:right;font-size:14px;font-weight:500;color:${flagColor};">${esc(latest.valueRaw)}</div>
             <div style="font-size:11px;color:${SUB};min-width:80px;text-align:right;">${esc(latest.order?.date||'')}</div>
           </div>
           ${isOpen ? `<div style="border-top:1px solid ${LINE};padding:8px 14px;overflow-x:auto;" class="lt-scroll">
+            ${hiddenCount ? `<div style="margin-bottom:6px;"><a href="#" class="lt-toggle-hidden" data-test="${t.id}" style="font-size:11px;color:${SUB};text-decoration:underline;">${showHidden ? 'Hide the '+hiddenCount+' hidden result'+(hiddenCount>1?'s':'') : 'Show '+hiddenCount+' hidden result'+(hiddenCount>1?'s':'')}</a></div>` : ''}
             <table style="width:100%;border-collapse:collapse;font-size:12px;">
               <thead><tr style="color:${SUB};text-align:left;"><th style="padding:4px 6px;">Date</th><th style="padding:4px 6px;">Value</th><th style="padding:4px 6px;">Ref range</th><th style="padding:4px 6px;">Flag</th><th style="padding:4px 6px;">Physician</th><th style="padding:4px 6px;">Facility</th><th style="padding:4px 6px;">Source notes</th><th style="padding:4px 6px;">Context notes</th><th style="padding:4px 6px;">Printed as</th><th style="padding:4px 6px;"></th></tr></thead>
               <tbody>
-              ${rs.slice().reverse().map(r=>{
+              ${detailRows.slice().reverse().map(r=>{
                 const f = computeFlag(r); const fc = f==='H'?HIGH:f==='L'?LOW:SUB;
                 const isMoving = movingResultId===r.id;
                 const isEditing = isEditor && editingResultId===r.id;
+                const isDeleting = isEditor && deletingResultId===r.id;
+                const rowStyle = r.hidden ? `border-top:1px solid ${LINE};opacity:0.5;` : `border-top:1px solid ${LINE};`;
                 const moveRow = isMoving ? `<tr style="border-top:1px solid ${LINE};background:${PAPER};"><td colspan="10" style="padding:8px 6px;">
                   <span style="font-size:12px;margin-right:6px;">Move this result to:</span>
                   <select class="lt-move-select" data-result="${r.id}" style="padding:4px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;">
@@ -667,7 +699,15 @@ function renderResultsTab(){
                   <button class="lt-edit-confirm" data-result="${r.id}" style="background:${TEAL};color:#fff;border:none;padding:5px 10px;border-radius:5px;font-size:12px;margin-left:4px;">Save</button>
                   <button class="lt-edit-cancel" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-left:4px;">Cancel</button>
                 </td></tr>` : '';
-                return `<tr style="border-top:1px solid ${LINE};"><td class="lt-mono"><a href="#" class="lt-goto-order" data-order="${r.orderId}" style="padding:4px 6px;display:block;color:${TEAL};text-decoration:underline;">${esc(r.order?.date||'')}</a></td><td class="lt-mono" style="padding:4px 6px;color:${fc};">${esc(r.valueRaw)} ${esc(r.unit)}</td><td class="lt-mono" style="padding:4px 6px;color:${SUB};">${r.refLow!=null?r.refLow:''}${r.refLow!=null&&r.refHigh!=null?' - ':''}${r.refHigh!=null?r.refHigh:''}</td><td style="padding:4px 6px;color:${fc};">${f==='normal'?'':f}</td><td style="padding:4px 6px;">${esc(r.order?.orderingPhysician||'')}</td><td style="padding:4px 6px;">${esc(r.order?.facility||'')}</td><td style="padding:4px 6px;color:${SUB};font-size:11px;">${esc(r.order?.sourceNotes||'')}</td><td style="padding:4px 6px;color:${SUB};font-size:11px;">${esc(r.order?.contextNotes||'')}</td><td style="padding:4px 6px;color:${SUB};font-size:11px;">${esc(r.rawLabel||'')}</td><td style="padding:4px 6px;white-space:nowrap;">${(r.order&&r.order.photoCount) ? `<a href="#" class="lt-goto-source" data-order="${r.orderId}" data-count="${r.order.photoCount}" style="color:${TEAL};text-decoration:underline;font-size:11px;margin-right:8px;">Source</a>` : ''}${isEditor ? `<button class="lt-edit-start" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};margin-right:4px;">Edit</button><button class="lt-move-start" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};">Move</button>` : ''}</td></tr>${editRow}${moveRow}`;
+                const deleteRow = isDeleting ? `<tr style="border-top:1px solid ${LINE};background:${HIGH_BG};"><td colspan="10" style="padding:8px 6px;">
+                  <span style="font-size:12px;color:${HIGH};margin-right:8px;">Permanently delete this result? This can't be undone.</span>
+                  <button class="lt-delete-confirm" data-result="${r.id}" style="background:${HIGH};color:#fff;border:none;padding:5px 10px;border-radius:5px;font-size:12px;margin-right:4px;">Delete permanently</button>
+                  <button class="lt-delete-cancel" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;">Cancel</button>
+                </td></tr>` : '';
+                const actionButtons = !isEditor ? '' : r.hidden
+                  ? `<button class="lt-unhide" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};margin-right:4px;">Unhide</button><button class="lt-delete-start" data-result="${r.id}" style="background:none;border:1px solid ${HIGH};padding:3px 8px;border-radius:4px;font-size:11px;color:${HIGH};">Delete</button>`
+                  : `<button class="lt-edit-start" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};margin-right:4px;">Edit</button><button class="lt-move-start" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};margin-right:4px;">Move</button><button class="lt-hide" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};">Hide</button>`;
+                return `<tr style="${rowStyle}"><td class="lt-mono"><a href="#" class="lt-goto-order" data-order="${r.orderId}" style="padding:4px 6px;display:block;color:${TEAL};text-decoration:underline;">${esc(r.order?.date||'')}</a></td><td class="lt-mono" style="padding:4px 6px;color:${fc};">${esc(r.valueRaw)} ${esc(r.unit)}${r.hidden?' <span style="color:'+SUB+';">(hidden)</span>':''}</td><td class="lt-mono" style="padding:4px 6px;color:${SUB};">${r.refLow!=null?r.refLow:''}${r.refLow!=null&&r.refHigh!=null?' - ':''}${r.refHigh!=null?r.refHigh:''}</td><td style="padding:4px 6px;color:${fc};">${f==='normal'?'':f}</td><td style="padding:4px 6px;">${esc(r.order?.orderingPhysician||'')}</td><td style="padding:4px 6px;">${esc(r.order?.facility||'')}</td><td style="padding:4px 6px;color:${SUB};font-size:11px;">${esc(r.order?.sourceNotes||'')}</td><td style="padding:4px 6px;color:${SUB};font-size:11px;">${esc(r.order?.contextNotes||'')}</td><td style="padding:4px 6px;color:${SUB};font-size:11px;">${esc(r.rawLabel||'')}</td><td style="padding:4px 6px;white-space:nowrap;">${(r.order&&r.order.photoCount) ? `<a href="#" class="lt-goto-source" data-order="${r.orderId}" data-count="${r.order.photoCount}" style="color:${TEAL};text-decoration:underline;font-size:11px;margin-right:8px;">Source</a>` : ''}${actionButtons}</td></tr>${editRow}${moveRow}${deleteRow}`;
               }).join('')}
               </tbody>
             </table>
@@ -812,7 +852,7 @@ function renderReportsTab(){
               <button class="lt-edit-confirm" data-result="${r.id}" style="background:${TEAL};color:#fff;border:none;padding:5px 10px;border-radius:5px;font-size:12px;margin-left:4px;">Save</button>
               <button class="lt-edit-cancel" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-left:4px;">Cancel</button>
             </td></tr>` : '';
-            return `<tr style="border-top:1px solid ${LINE};"><td style="padding:4px 6px;">${esc(cat?cat.name:r.rawLabel)}</td><td class="lt-mono" style="padding:4px 6px;color:${fc};">${esc(r.valueRaw)} ${esc(r.unit)}</td><td class="lt-mono" style="padding:4px 6px;color:${SUB};">${r.refLow!=null?r.refLow:''}${r.refLow!=null&&r.refHigh!=null?' - ':''}${r.refHigh!=null?r.refHigh:''}</td><td style="padding:4px 6px;color:${fc};">${f==='normal'?'':f}</td><td style="padding:4px 6px;">${isEditor ? `<button class="lt-edit-start" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};">Edit</button>` : ''}</td></tr>${editRow}`;
+            return `<tr style="border-top:1px solid ${LINE};${r.hidden?'opacity:0.5;':''}"><td style="padding:4px 6px;">${esc(cat?cat.name:r.rawLabel)}${r.hidden?' <span style="color:'+SUB+';font-size:11px;">(hidden)</span>':''}</td><td class="lt-mono" style="padding:4px 6px;color:${fc};">${esc(r.valueRaw)} ${esc(r.unit)}</td><td class="lt-mono" style="padding:4px 6px;color:${SUB};">${r.refLow!=null?r.refLow:''}${r.refLow!=null&&r.refHigh!=null?' - ':''}${r.refHigh!=null?r.refHigh:''}</td><td style="padding:4px 6px;color:${fc};">${f==='normal'?'':f}</td><td style="padding:4px 6px;white-space:nowrap;">${isEditor ? (r.hidden ? `<button class="lt-unhide" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};">Unhide</button>` : `<button class="lt-edit-start" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};margin-right:4px;">Edit</button><button class="lt-hide" data-result="${r.id}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};">Hide</button>`) : ''}</td></tr>${editRow}`;
           }).join('')}
           </tbody>
         </table>
@@ -994,7 +1034,7 @@ function wireEvents(){
   const cancelBtn = root.querySelector('#lt-cancel-extraction'); if(cancelBtn) cancelBtn.onclick = cancelExtraction;
 
   root.querySelectorAll('.lt-test-row').forEach(el=>{
-    el.onclick = ()=>{ const id = el.getAttribute('data-test'); expandedTest = expandedTest===id ? null : id; movingResultId = null; editingResultId = null; render(); };
+    el.onclick = ()=>{ const id = el.getAttribute('data-test'); expandedTest = expandedTest===id ? null : id; movingResultId = null; editingResultId = null; deletingResultId = null; render(); };
   });
   root.querySelectorAll('.lt-move-start').forEach(el=>{
     el.onclick = (e)=>{ e.stopPropagation(); movingResultId = el.getAttribute('data-result'); editingResultId = null; render(); };
@@ -1025,6 +1065,30 @@ function wireEvents(){
       const rl = root.querySelector(`.lt-edit-reflow[data-result="${resultId}"]`);
       const rh = root.querySelector(`.lt-edit-refhigh[data-result="${resultId}"]`);
       if(v) editResult(resultId, v.value, u?u.value:'', rl?rl.value:'', rh?rh.value:'');
+    };
+  });
+
+  root.querySelectorAll('.lt-hide').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); e.preventDefault(); hideResult(el.getAttribute('data-result'), true); };
+  });
+  root.querySelectorAll('.lt-unhide').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); e.preventDefault(); hideResult(el.getAttribute('data-result'), false); };
+  });
+  root.querySelectorAll('.lt-delete-start').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); deletingResultId = el.getAttribute('data-result'); render(); };
+  });
+  root.querySelectorAll('.lt-delete-cancel').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); deletingResultId = null; render(); };
+  });
+  root.querySelectorAll('.lt-delete-confirm').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); deleteResult(el.getAttribute('data-result')); };
+  });
+  root.querySelectorAll('.lt-toggle-hidden').forEach(el=>{
+    el.onclick = (e)=>{
+      e.stopPropagation(); e.preventDefault();
+      const testId = el.getAttribute('data-test');
+      if(showHiddenTests.has(testId)) showHiddenTests.delete(testId); else showHiddenTests.add(testId);
+      render();
     };
   });
 
