@@ -50,6 +50,18 @@ let movingResultId = null;
 let deletingResultId = null;
 let showHiddenTests = new Set();
 let showHiddenInOrders = new Set();
+
+// --- Clinical documents / signals ---
+let CLINICAL_DOCS = [];
+let SIGNALS = [];
+let pendingDocExtraction = null;
+let docExtracting = false;
+let docExtractError = '';
+let expandedDoc = null;
+let editingDocId = null;
+let deletingDocId = null;
+const REGION_OPTIONS = ['Head','Neck','Chest','Abdomen/Midsection','Pelvis','Back/Spine','Arm','Leg','Whole body/Systemic'];
+
 let editingResultId = null;
 let editingOrderId = null;
 let expandedOrder = null;
@@ -196,6 +208,33 @@ function orderFromDb(r){ return { id:r.id, date:r.date, reportedDate:r.reported_
 function resultToDb(r){ return { id:r.id, order_id:r.orderId, test_id:r.testId, raw_label:r.rawLabel||'', value:(r.value==null||isNaN(r.value))?null:r.value, value_raw:r.valueRaw||'', unit:r.unit||'', ref_low:r.refLow, ref_high:r.refHigh, flag:r.flag||'', hidden:!!r.hidden }; }
 function resultFromDb(r){ return { id:r.id, orderId:r.order_id, testId:r.test_id, rawLabel:r.raw_label||'', value:r.value, valueRaw:r.value_raw||'', unit:r.unit||'', refLow:r.ref_low, refHigh:r.ref_high, flag:r.flag||'', hidden:!!r.hidden }; }
 
+function docToDb(d){ return { id:d.id, date:d.date, reported_date:d.reportedDate||null, document_type:d.documentType||'', ordering_physician:d.orderingPhysician||'', reading_physician:d.readingPhysician||'', additional_physicians:d.additionalPhysicians||'', facility:d.facility||'', accession_number:d.accessionNumber||'', encounter_id:d.encounterId||'', indication:d.indication||'', findings_text:d.findingsText||'', impression_text:d.impressionText||'', full_notes:d.fullNotes||'', photo_count:d.photoCount||0, created_at:d.createdAt||new Date().toISOString() }; }
+function docFromDb(r){ return { id:r.id, date:r.date, reportedDate:r.reported_date||'', documentType:r.document_type||'', orderingPhysician:r.ordering_physician||'', readingPhysician:r.reading_physician||'', additionalPhysicians:r.additional_physicians||'', facility:r.facility||'', accessionNumber:r.accession_number||'', encounterId:r.encounter_id||'', indication:r.indication||'', findingsText:r.findings_text||'', impressionText:r.impression_text||'', fullNotes:r.full_notes||'', photoCount:r.photo_count||0, createdAt:r.created_at }; }
+
+function signalToDb(s){ return { id:s.id, document_id:s.documentId||null, type:s.type||'finding', source_type:s.sourceType||'clinical_document', date:s.date, end_date:s.endDate||null, domain:s.domain||'', subdomain:s.subdomain||'', structure_tag:s.structureTag||'', region_tags:s.regionTags||[], is_ancillary:!!s.isAncillary, is_negative:!!s.isNegative, text:s.text||'', measurement_value:(s.measurementValue==null||isNaN(s.measurementValue))?null:s.measurementValue, measurement_unit:s.measurementUnit||'', measurement_label:s.measurementLabel||'', series_id:s.seriesId||null, series_label:s.seriesLabel||'', has_recommendation:!!s.hasRecommendation, recommendation_text:s.recommendationText||'', recommendation_resolved:!!s.recommendationResolved, hidden:!!s.hidden }; }
+function signalFromDb(r){ return { id:r.id, documentId:r.document_id, type:r.type||'finding', sourceType:r.source_type||'clinical_document', date:r.date, endDate:r.end_date, domain:r.domain||'', subdomain:r.subdomain||'', structureTag:r.structure_tag||'', regionTags:r.region_tags||[], isAncillary:!!r.is_ancillary, isNegative:!!r.is_negative, text:r.text||'', measurementValue:r.measurement_value, measurementUnit:r.measurement_unit||'', measurementLabel:r.measurement_label||'', seriesId:r.series_id, seriesLabel:r.series_label||'', hasRecommendation:!!r.has_recommendation, recommendationText:r.recommendation_text||'', recommendationResolved:!!r.recommendation_resolved, hidden:!!r.hidden }; }
+
+async function loadClinicalDocs(){
+  try {
+    const { data, error } = await sb.from('clinical_documents').select('*').order('date', { ascending: true });
+    if(error) throw error;
+    CLINICAL_DOCS = (data||[]).map(docFromDb);
+  } catch(e){ console.error('load clinical_documents failed', e); CLINICAL_DOCS = []; }
+  try {
+    const { data, error } = await sb.from('signals').select('*');
+    if(error) throw error;
+    SIGNALS = (data||[]).map(signalFromDb);
+  } catch(e){ console.error('load signals failed', e); SIGNALS = []; }
+}
+async function saveClinicalDocs(){
+  try { const { error } = await sb.from('clinical_documents').upsert(CLINICAL_DOCS.map(docToDb)); if(error) console.error('saveClinicalDocs error', error); }
+  catch(e){ console.error('saveClinicalDocs failed', e); }
+}
+async function saveSignals(){
+  try { const { error } = await sb.from('signals').upsert(SIGNALS.map(signalToDb)); if(error) console.error('saveSignals error', error); }
+  catch(e){ console.error('saveSignals failed', e); }
+}
+
 async function loadAll(){
   try {
     const { data, error } = await sb.from('catalog').select('*');
@@ -219,6 +258,8 @@ async function loadAll(){
     if(error) throw error;
     RESULTS = (data||[]).map(resultFromDb);
   } catch(e){ console.error('load results failed', e); RESULTS = []; }
+
+  await loadClinicalDocs();
 
   loaded = true;
   render();
@@ -371,6 +412,149 @@ async function extractFromImage(rawFile, appendMode){
     pendingExtraction = null;
   }
   extracting = false;
+  render();
+}
+
+async function extractDocumentFromImage(rawFile, appendMode){
+  docExtracting = true; docExtractError=''; render();
+  try {
+    let b64, mediaType, extractionDataUrl = null, thumbDataUrl = null;
+
+    try { extractionDataUrl = await resizeImageFile(rawFile, 1568, 0.85); } catch(e){ extractionDataUrl = null; }
+
+    if(!extractionDataUrl && isHeic(rawFile)){
+      try {
+        const converted = await browserHeicConvert(rawFile);
+        extractionDataUrl = await resizeImageFile(converted, 1568, 0.85);
+      } catch(e){ extractionDataUrl = null; }
+    }
+
+    if(extractionDataUrl){
+      b64 = extractionDataUrl.split(',')[1];
+      mediaType = 'image/jpeg';
+      try { thumbDataUrl = await resizeDataUrl(extractionDataUrl, 1200, 0.72); } catch(e){ thumbDataUrl = extractionDataUrl; }
+    } else {
+      b64 = await fileToBase64(rawFile);
+      mediaType = isHeic(rawFile) ? 'image/heic' : (rawFile.type || 'image/jpeg');
+    }
+
+    const { data: fnData, error: fnError } = await sb.functions.invoke('extract-document', {
+      body: { imageBase64: b64, mediaType }
+    });
+    if(fnError) throw fnError;
+    const payload = typeof fnData === 'string' ? JSON.parse(fnData) : fnData;
+    if(payload.error) throw new Error(payload.error);
+    const ex = payload.extraction || payload;
+
+    if(!thumbDataUrl){
+      try {
+        if(payload.convertedJpegBase64){
+          thumbDataUrl = await resizeDataUrl('data:image/jpeg;base64,'+payload.convertedJpegBase64, 1200, 0.72);
+        }
+      } catch(e){ thumbDataUrl = null; }
+    }
+
+    const newSignals = (ex.signals||[]).map(s=>({
+      rowId: uid(),
+      include: true,
+      type: s.type || 'finding',
+      domain: s.domain || '',
+      subdomain: s.subdomain || '',
+      structureTag: s.structureTag || '',
+      regionTags: Array.isArray(s.regionTags) ? s.regionTags : [],
+      isAncillary: !!s.isAncillary,
+      isNegative: !!s.isNegative,
+      text: s.text || '',
+      measurementValue: s.measurementValue!=null ? String(s.measurementValue) : '',
+      measurementUnit: s.measurementUnit || '',
+      measurementLabel: s.measurementLabel || '',
+      hasRecommendation: !!s.hasRecommendation,
+      recommendationText: s.recommendationText || ''
+    }));
+
+    if(appendMode && pendingDocExtraction){
+      pendingDocExtraction.signalRows = pendingDocExtraction.signalRows.concat(newSignals);
+      if(thumbDataUrl) pendingDocExtraction.photos.push(thumbDataUrl);
+    } else {
+      pendingDocExtraction = {
+        date: ex.date || '',
+        reportedDate: ex.reportedDate || '',
+        documentType: ex.documentType || '',
+        orderingPhysician: ex.orderingPhysician || '',
+        readingPhysician: ex.readingPhysician || '',
+        additionalPhysicians: ex.additionalPhysicians || '',
+        facility: ex.facility || '',
+        accessionNumber: ex.accessionNumber || '',
+        encounterId: ex.encounterId || '',
+        indication: ex.indication || '',
+        findingsText: ex.findingsText || '',
+        impressionText: ex.impressionText || '',
+        photos: thumbDataUrl ? [thumbDataUrl] : [],
+        signalRows: newSignals
+      };
+    }
+  } catch(e){
+    docExtractError = 'Could not read this document. Try a clearer photo, or crop to the report text, then try again. (' + (e.message||e) + ')';
+    pendingDocExtraction = null;
+  }
+  docExtracting = false;
+  render();
+}
+
+async function saveDocExtraction(){
+  if(!pendingDocExtraction) return;
+  const rows = pendingDocExtraction.signalRows.filter(s=>s.include && s.text.trim());
+  const docId = uid();
+  const photos = pendingDocExtraction.photos || [];
+  CLINICAL_DOCS.push({
+    id: docId,
+    date: pendingDocExtraction.date || new Date().toISOString().slice(0,10),
+    reportedDate: pendingDocExtraction.reportedDate || '',
+    documentType: pendingDocExtraction.documentType || '',
+    orderingPhysician: pendingDocExtraction.orderingPhysician || '',
+    readingPhysician: pendingDocExtraction.readingPhysician || '',
+    additionalPhysicians: pendingDocExtraction.additionalPhysicians || '',
+    facility: pendingDocExtraction.facility || '',
+    accessionNumber: pendingDocExtraction.accessionNumber || '',
+    encounterId: pendingDocExtraction.encounterId || '',
+    indication: pendingDocExtraction.indication || '',
+    findingsText: pendingDocExtraction.findingsText || '',
+    impressionText: pendingDocExtraction.impressionText || '',
+    fullNotes: '',
+    photoCount: photos.length,
+    createdAt: new Date().toISOString()
+  });
+  for(const s of rows){
+    SIGNALS.push({
+      id: uid(),
+      documentId: docId,
+      type: s.type || 'finding',
+      sourceType: 'clinical_document',
+      date: pendingDocExtraction.date || new Date().toISOString().slice(0,10),
+      endDate: null,
+      domain: s.domain || '',
+      subdomain: s.subdomain || '',
+      structureTag: s.structureTag || '',
+      regionTags: s.regionTags || [],
+      isAncillary: !!s.isAncillary,
+      isNegative: !!s.isNegative,
+      text: s.text || '',
+      measurementValue: s.measurementValue!==''? parseFloat(s.measurementValue): null,
+      measurementUnit: s.measurementUnit || '',
+      measurementLabel: s.measurementLabel || '',
+      seriesId: null,
+      seriesLabel: '',
+      hasRecommendation: !!s.hasRecommendation,
+      recommendationText: s.recommendationText || '',
+      recommendationResolved: false,
+      hidden: false
+    });
+  }
+  await saveClinicalDocs();
+  if(photos.length) await savePhotosForOrder(docId, photos);
+  await saveSignals();
+  pendingDocExtraction = null;
+  activeTab = 'documents';
   render();
 }
 
@@ -635,6 +819,127 @@ function renderAddTab(){
   return html;
 }
 
+function renderAddDocTab(){
+  let html = '';
+  if(!pendingDocExtraction){
+    html += `
+    <div style="max-width:520px;margin:0 auto;padding:32px 16px;">
+      <div style="border:1px dashed ${LINE};border-radius:10px;padding:28px 20px;text-align:center;background:${CARD};">
+        <div class="lt-head" style="font-size:16px;font-weight:600;margin-bottom:6px;">Add a clinical document</div>
+        <div style="font-size:13px;color:${SUB};margin-bottom:18px;">Photograph an imaging report, consult note, discharge summary, or similar. Every finding gets pulled out as its own reviewable signal before anything saves.</div>
+        <input type="file" accept="image/*,.heic,.heif" id="lt-docfile-input" style="display:none"/>
+        <button id="lt-docupload-btn" style="background:${TEAL};color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:14px;font-weight:500;">Choose photo</button>
+        ${docExtracting ? `<div style="margin-top:16px;font-size:13px;color:${TEAL};">Reading document...</div>` : ''}
+        ${docExtractError ? `<div style="margin-top:16px;font-size:13px;color:${HIGH};">${esc(docExtractError)}</div>` : ''}
+      </div>
+    </div>`;
+  } else {
+    const p = pendingDocExtraction;
+    html += `<div style="max-width:960px;margin:0 auto;padding:24px 16px 60px;">
+      <div class="lt-head" style="font-size:18px;font-weight:600;margin-bottom:16px;">Review document</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:10px;">
+        <label style="font-size:12px;color:${SUB};">Date
+          <input type="date" id="lt-doc-date" value="${esc(p.date)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Reported date
+          <input type="date" id="lt-doc-reporteddate" value="${esc(p.reportedDate)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Document type
+          <input type="text" id="lt-doc-type" value="${esc(p.documentType)}" placeholder="Imaging, Consult..." style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Facility
+          <input type="text" id="lt-doc-facility" value="${esc(p.facility)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;">
+        <label style="font-size:12px;color:${SUB};">Ordering physician
+          <input type="text" id="lt-doc-ordering" value="${esc(p.orderingPhysician)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Reading physician
+          <input type="text" id="lt-doc-reading" value="${esc(p.readingPhysician)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Other physician(s)
+          <input type="text" id="lt-doc-additional" value="${esc(p.additionalPhysicians)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:20px;">
+        <label style="font-size:12px;color:${SUB};">Accession/reference #
+          <input type="text" id="lt-doc-accession" value="${esc(p.accessionNumber)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Encounter ID (if stated)
+          <input type="text" id="lt-doc-encounter" value="${esc(p.encounterId)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+        <label style="font-size:12px;color:${SUB};">Indication / reason for exam
+          <input type="text" id="lt-doc-indication" value="${esc(p.indication)}" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:13px;"/>
+        </label>
+      </div>
+      <details style="margin-bottom:20px;">
+        <summary style="font-size:12px;color:${SUB};cursor:pointer;">Full Findings / Impression text (from the document)</summary>
+        <label style="font-size:11px;color:${SUB};display:block;margin-top:8px;">Findings
+          <textarea id="lt-doc-findings" rows="4" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:12px;font-family:inherit;">${esc(p.findingsText)}</textarea>
+        </label>
+        <label style="font-size:11px;color:${SUB};display:block;margin-top:8px;">Impression
+          <textarea id="lt-doc-impression" rows="3" style="width:100%;padding:8px;border:1px solid ${LINE};border-radius:6px;margin-top:4px;font-size:12px;font-family:inherit;">${esc(p.impressionText)}</textarea>
+        </label>
+      </details>
+
+      <div class="lt-head" style="font-size:15px;font-weight:600;margin-bottom:10px;">Signals (${p.signalRows.length})</div>
+      ${p.signalRows.map(s=>renderSignalCard(s)).join('')}
+      <button id="lt-add-signal-row" style="margin-top:6px;background:none;border:1px solid ${LINE};padding:6px 12px;border-radius:6px;font-size:12px;color:${INK};">+ Add signal</button>
+
+      <div style="border:1px solid ${LINE};border-radius:8px;padding:14px;margin-top:20px;background:${CARD};">
+        <div style="font-size:12px;font-weight:500;margin-bottom:2px;">More pages to this same document?</div>
+        <input type="file" accept="image/*,.heic,.heif" id="lt-docfile-input-append" style="display:none"/>
+        <button id="lt-docupload-append-btn" style="background:none;border:1px solid ${LINE};padding:6px 12px;border-radius:6px;font-size:12px;color:${INK};">+ Add page (photo)</button>
+      </div>
+
+      <div style="margin-top:24px;display:flex;gap:10px;">
+        <button id="lt-save-doc-extraction" style="background:${TEAL};color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:14px;font-weight:500;">Save document</button>
+        <button id="lt-cancel-doc-extraction" style="background:none;border:1px solid ${LINE};padding:10px 18px;border-radius:8px;font-size:14px;color:${INK};">Cancel</button>
+      </div>
+    </div>`;
+  }
+  return html;
+}
+
+function renderSignalCard(s){
+  const typeColor = s.type==='diagnosis' ? LOW : TEAL;
+  const typeBg = s.type==='diagnosis' ? LOW_BG : TEAL_BG;
+  return `<div class="lt-signal-card" data-row="${s.rowId}" style="background:${CARD};border:1px solid ${LINE};border-radius:8px;padding:12px;margin-bottom:8px;${s.include?'':'opacity:0.5;'}">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+      <input type="checkbox" class="lt-sig-include" data-row="${s.rowId}" ${s.include?'checked':''}/>
+      <select class="lt-sig-type" data-row="${s.rowId}" style="background:${typeBg};color:${typeColor};border:1px solid ${LINE};border-radius:4px;padding:3px 6px;font-size:12px;">
+        <option value="finding" ${s.type==='finding'?'selected':''}>Finding</option>
+        <option value="diagnosis" ${s.type==='diagnosis'?'selected':''}>Diagnosis</option>
+        <option value="impression" ${s.type==='impression'?'selected':''}>Impression</option>
+      </select>
+      <button class="lt-sig-remove" data-row="${s.rowId}" style="margin-left:auto;background:none;border:none;color:${SUB};font-size:15px;">&times;</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
+      <input type="text" class="lt-sig-domain" data-row="${s.rowId}" value="${esc(s.domain)}" placeholder="Domain" style="padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/>
+      <input type="text" class="lt-sig-subdomain" data-row="${s.rowId}" value="${esc(s.subdomain)}" placeholder="Subdomain" style="padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/>
+      <input type="text" class="lt-sig-structure" data-row="${s.rowId}" value="${esc(s.structureTag)}" placeholder="Structure (e.g. Left adrenal gland)" style="padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/>
+    </div>
+    <div style="margin-bottom:8px;">
+      ${REGION_OPTIONS.map(r=>`<span class="lt-sig-region" data-row="${s.rowId}" data-region="${esc(r)}" style="display:inline-block;cursor:pointer;font-size:11px;padding:2px 7px;margin:0 4px 4px 0;border-radius:10px;border:1px solid ${LINE};background:${s.regionTags.includes(r)?TEAL:PAPER};color:${s.regionTags.includes(r)?'#fff':SUB};">${esc(r)}</span>`).join('')}
+    </div>
+    <div style="display:flex;gap:16px;margin-bottom:8px;font-size:12px;color:${SUB};">
+      <label><input type="checkbox" class="lt-sig-ancillary" data-row="${s.rowId}" ${s.isAncillary?'checked':''}/> Ancillary/incidental</label>
+      <label><input type="checkbox" class="lt-sig-negative" data-row="${s.rowId}" ${s.isNegative?'checked':''}/> Negative/ruled out</label>
+    </div>
+    <textarea class="lt-sig-text" data-row="${s.rowId}" rows="2" placeholder="Excerpt / description" style="width:100%;padding:6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;font-family:inherit;margin-bottom:8px;">${esc(s.text)}</textarea>
+    <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:8px;margin-bottom:8px;">
+      <input type="text" class="lt-sig-measval lt-mono" data-row="${s.rowId}" value="${esc(s.measurementValue)}" placeholder="Measurement" style="padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/>
+      <input type="text" class="lt-sig-measunit" data-row="${s.rowId}" value="${esc(s.measurementUnit)}" placeholder="Unit" style="padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/>
+      <input type="text" class="lt-sig-measlabel" data-row="${s.rowId}" value="${esc(s.measurementLabel)}" placeholder="What's being measured (e.g. Left adrenal nodule size)" style="padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;font-size:12px;">
+      <label style="color:${SUB};white-space:nowrap;"><input type="checkbox" class="lt-sig-hasrec" data-row="${s.rowId}" ${s.hasRecommendation?'checked':''}/> Has recommendation</label>
+      <input type="text" class="lt-sig-rectext" data-row="${s.rowId}" value="${esc(s.recommendationText)}" placeholder="e.g. Further workup advised" style="flex:1;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;"/>
+    </div>
+  </div>`;
+}
+
 function renderResultsTab(){
   if(!RESULTS.length){
     return `<div style="max-width:480px;margin:60px auto;text-align:center;color:${SUB};font-size:14px;">
@@ -791,12 +1096,13 @@ async function attachPhotoToOrder(orderId, file){
       dataUrl = await resizeDataUrl('data:image/jpeg;base64,'+payload.convertedJpegBase64, 1200, 0.72);
     }
     const blob = await dataUrlToBlob(dataUrl);
-    const o = ORDERS.find(x=>x.id===orderId);
+    const o = ORDERS.find(x=>x.id===orderId) || CLINICAL_DOCS.find(x=>x.id===orderId);
+    if(!o) return;
     const idx = o.photoCount || 0;
     const { error } = await sb.storage.from('lab-photos').upload(orderId+'/'+idx+'.jpg', blob, { contentType:'image/jpeg', upsert:true });
     if(error){ console.error('attach photo failed', error); return; }
     o.photoCount = idx + 1;
-    await saveOrders();
+    if(ORDERS.includes(o)) await saveOrders(); else await saveClinicalDocs();
     render();
   } catch(e){ console.error('attach photo failed', e); }
 }
@@ -901,6 +1207,124 @@ function renderReportsTab(){
   return html;
 }
 
+function editDoc(docId, date, reportedDate, documentType, ordering, reading, additional, facility, accession, encounter, indication){
+  const d = CLINICAL_DOCS.find(x=>x.id===docId);
+  if(!d) return;
+  d.date = date || d.date;
+  d.reportedDate = reportedDate || '';
+  d.documentType = documentType || '';
+  d.orderingPhysician = ordering || '';
+  d.readingPhysician = reading || '';
+  d.additionalPhysicians = additional || '';
+  d.facility = facility || '';
+  d.accessionNumber = accession || '';
+  d.encounterId = encounter || '';
+  d.indication = indication || '';
+  saveClinicalDocs();
+  editingDocId = null;
+  render();
+}
+
+async function deleteDoc(docId){
+  const d = CLINICAL_DOCS.find(x=>x.id===docId);
+  if(!d) return;
+  try {
+    if(d.photoCount){
+      const paths = [];
+      for(let i=0;i<d.photoCount;i++) paths.push(docId+'/'+i+'.jpg');
+      const { error: storageError } = await sb.storage.from('lab-photos').remove(paths);
+      if(storageError) console.error('doc photo cleanup failed', storageError);
+    }
+    const { error } = await sb.from('clinical_documents').delete().eq('id', docId);
+    if(error){ console.error('deleteDoc error', error); return; }
+  } catch(e){ console.error('deleteDoc failed', e); return; }
+  CLINICAL_DOCS = CLINICAL_DOCS.filter(x=>x.id!==docId);
+  SIGNALS = SIGNALS.filter(x=>x.documentId!==docId);
+  deletingDocId = null;
+  expandedDoc = null;
+  render();
+}
+
+function renderDocumentsTab(){
+  if(!CLINICAL_DOCS.length){
+    return `<div style="max-width:480px;margin:60px auto;text-align:center;color:${SUB};font-size:14px;">
+      No clinical documents yet. Add one from the Add document tab.
+    </div>`;
+  }
+  const sorted = CLINICAL_DOCS.slice().sort((a,b)=> b.date.localeCompare(a.date));
+  let html = `<div style="max-width:1000px;margin:0 auto;padding:20px 16px 60px;">`;
+  for(const d of sorted){
+    const sigs = SIGNALS.filter(s=>s.documentId===d.id);
+    const isOpen = expandedDoc===d.id;
+    const isEditingDoc = isEditor && editingDocId===d.id;
+    html += `<div style="background:${CARD};border:1px solid ${LINE};border-radius:8px;margin-bottom:8px;overflow:hidden;">
+      <div class="lt-doc-row" data-doc="${d.id}" style="display:flex;align-items:center;gap:14px;padding:12px 14px;cursor:pointer;">
+        <div style="flex:1;min-width:0;">
+          <div class="lt-mono" style="font-size:14px;font-weight:500;">${esc(d.date)} <span style="font-size:11px;color:${SUB};font-weight:400;">${esc(d.documentType)}</span></div>
+          <div style="font-size:11px;color:${SUB};">${esc(d.orderingPhysician||'Physician not recorded')}${d.facility?' &middot; '+esc(d.facility):''} &middot; ${sigs.length} signal${sigs.length!==1?'s':''}${d.reportedDate?' &middot; reported '+esc(d.reportedDate):''}</div>
+        </div>
+        <div style="font-size:11px;color:${SUB};">${d.photoCount?d.photoCount+' photo'+(d.photoCount>1?'s':''):'no photo'}</div>
+      </div>
+      ${isOpen ? `<div style="border-top:1px solid ${LINE};padding:12px 14px;">
+        ${isEditingDoc ? `<div style="background:${PAPER};border-radius:6px;padding:10px;margin-bottom:10px;">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
+            <label style="font-size:11px;color:${SUB};">Date<input type="date" class="lt-doc-edit-date" data-doc="${d.id}" value="${esc(d.date)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Reported date<input type="date" class="lt-doc-edit-reported" data-doc="${d.id}" value="${esc(d.reportedDate)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Type<input type="text" class="lt-doc-edit-type" data-doc="${d.id}" value="${esc(d.documentType)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Facility<input type="text" class="lt-doc-edit-facility" data-doc="${d.id}" value="${esc(d.facility)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
+            <label style="font-size:11px;color:${SUB};">Ordering<input type="text" class="lt-doc-edit-ordering" data-doc="${d.id}" value="${esc(d.orderingPhysician)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Reading<input type="text" class="lt-doc-edit-reading" data-doc="${d.id}" value="${esc(d.readingPhysician)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Other physician(s)<input type="text" class="lt-doc-edit-additional" data-doc="${d.id}" value="${esc(d.additionalPhysicians)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
+            <label style="font-size:11px;color:${SUB};">Accession #<input type="text" class="lt-doc-edit-accession" data-doc="${d.id}" value="${esc(d.accessionNumber)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Encounter ID<input type="text" class="lt-doc-edit-encounter" data-doc="${d.id}" value="${esc(d.encounterId)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+            <label style="font-size:11px;color:${SUB};">Indication<input type="text" class="lt-doc-edit-indication" data-doc="${d.id}" value="${esc(d.indication)}" style="width:100%;padding:5px 6px;border:1px solid ${LINE};border-radius:4px;font-size:12px;margin-top:2px;"/></label>
+          </div>
+          <button class="lt-doc-edit-save" data-doc="${d.id}" style="background:${TEAL};color:#fff;border:none;padding:6px 12px;border-radius:5px;font-size:12px;margin-right:6px;">Save</button>
+          <button class="lt-doc-edit-cancel" style="background:none;border:1px solid ${LINE};padding:6px 12px;border-radius:5px;font-size:12px;">Cancel</button>
+        </div>` : `<div style="margin-bottom:10px;">
+          <div style="font-size:12px;margin-bottom:2px;"><span style="color:${SUB};">Indication:</span> ${esc(d.indication)||'&mdash;'}</div>
+          <div style="font-size:12px;margin-bottom:8px;"><span style="color:${SUB};">Accession:</span> ${esc(d.accessionNumber)||'&mdash;'}${d.encounterId?' &middot; Encounter: '+esc(d.encounterId):''}</div>
+          <button class="lt-order-view-photo" data-order="${d.id}" data-count="${d.photoCount||0}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-right:6px;">${d.photoCount?'View source photo':'No photo attached'}</button>
+          ${isEditor ? `<button class="lt-doc-edit-start" data-doc="${d.id}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-right:6px;">Edit details</button>
+          <input type="file" accept="image/*,.heic,.heif" class="lt-order-attach-input" data-order="${d.id}" style="display:none"/>
+          <button class="lt-order-attach-btn" data-order="${d.id}" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;margin-right:6px;">${d.photoCount?'Add another photo':'Attach photo'}</button>
+          <button class="lt-doc-delete-start" data-doc="${d.id}" style="background:none;border:1px solid ${HIGH};padding:5px 10px;border-radius:5px;font-size:12px;color:${HIGH};">Delete document</button>` : ''}
+        </div>`}
+        ${deletingDocId===d.id ? `<div style="background:${HIGH_BG};border-radius:6px;padding:10px;margin-bottom:10px;">
+          <span style="font-size:12px;color:${HIGH};margin-right:8px;">Permanently delete this document and all ${sigs.length} signal${sigs.length!==1?'s':''} in it? This can't be undone.</span>
+          <button class="lt-doc-delete-confirm" data-doc="${d.id}" style="background:${HIGH};color:#fff;border:none;padding:5px 10px;border-radius:5px;font-size:12px;margin-right:4px;">Delete permanently</button>
+          <button class="lt-doc-delete-cancel" style="background:none;border:1px solid ${LINE};padding:5px 10px;border-radius:5px;font-size:12px;">Cancel</button>
+        </div>` : ''}
+        <div style="overflow-x:auto;" class="lt-scroll">
+        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <thead><tr style="color:${SUB};text-align:left;"><th style="padding:4px 6px;">Type</th><th style="padding:4px 6px;">Domain</th><th style="padding:4px 6px;">Structure</th><th style="padding:4px 6px;">Regions</th><th style="padding:4px 6px;">Text</th><th style="padding:4px 6px;">Measurement</th><th style="padding:4px 6px;"></th></tr></thead>
+          <tbody>
+          ${sigs.map(s=>{
+            const typeColor = s.type==='diagnosis'?LOW:s.isNegative?SUB:TEAL;
+            return `<tr style="border-top:1px solid ${LINE};${s.hidden?'opacity:0.5;':''}">
+              <td style="padding:4px 6px;color:${typeColor};">${esc(s.type)}${s.isNegative?' (ruled out)':''}${s.isAncillary?' (ancillary)':''}</td>
+              <td style="padding:4px 6px;">${esc(s.domain)}${s.subdomain?' / '+esc(s.subdomain):''}</td>
+              <td style="padding:4px 6px;">${esc(s.structureTag)}</td>
+              <td style="padding:4px 6px;font-size:11px;color:${SUB};">${(s.regionTags||[]).map(esc).join(', ')}</td>
+              <td style="padding:4px 6px;max-width:260px;">${esc(s.text)}${s.hasRecommendation?`<div style="color:${HIGH};font-size:11px;margin-top:2px;">&#9888; ${esc(s.recommendationText)}</div>`:''}</td>
+              <td class="lt-mono" style="padding:4px 6px;">${s.measurementValue!=null?esc(s.measurementValue)+' '+esc(s.measurementUnit):''}</td>
+              <td style="padding:4px 6px;">${isEditor ? `<button class="lt-sig-hide-toggle" data-signal="${s.id}" data-hidden="${s.hidden?'1':'0'}" style="background:none;border:1px solid ${LINE};padding:3px 8px;border-radius:4px;font-size:11px;color:${INK};">${s.hidden?'Unhide':'Hide'}</button>` : ''}</td>
+            </tr>`;
+          }).join('')}
+          </tbody>
+        </table>
+        </div>
+      </div>` : ''}
+    </div>`;
+  }
+  html += `</div>`;
+  return html;
+}
+
 function renderCatalogTab(){
   let html = `<div style="max-width:800px;margin:0 auto;padding:20px 16px 60px;">
     <div style="font-size:13px;color:${SUB};margin-bottom:16px;">Every distinct assay is tracked separately here, so similar-sounding tests (like different eGFR methods) never get merged. The reference range set here is the "usual" range the app compares each new report against -- when a report shows something different, you'll see it flagged in the review screen instead of having to notice it yourself.</div>
@@ -989,13 +1413,23 @@ function render(){
   if(!session){ root.innerHTML = renderLogin(); wireEvents(); return; }
   if(!loaded){ root.innerHTML = renderTopBar() + `<div style="padding:40px;text-align:center;color:${SUB};font-size:14px;">Loading...</div>`; return; }
   if(activeTab==='add' && !isEditor) activeTab = 'results';
-  let body = activeTab==='add' ? renderAddTab() : activeTab==='results' ? renderResultsTab() : activeTab==='reports' ? renderReportsTab() : renderCatalogTab();
+  if(activeTab==='adddoc' && !isEditor) activeTab = 'documents';
+  let body = activeTab==='add' ? renderAddTab()
+    : activeTab==='results' ? renderResultsTab()
+    : activeTab==='reports' ? renderReportsTab()
+    : activeTab==='catalog' ? renderCatalogTab()
+    : activeTab==='adddoc' ? renderAddDocTab()
+    : activeTab==='documents' ? renderDocumentsTab()
+    : renderCatalogTab();
   root.innerHTML = renderTopBar() + `
-    <div style="border-bottom:1px solid ${LINE};padding:0 4px;display:flex;gap:4px;">
+    <div style="border-bottom:1px solid ${LINE};padding:0 4px;display:flex;gap:4px;flex-wrap:wrap;">
       ${isEditor ? tabBtn('add','Add report') : ''}
       ${tabBtn('results','Results')}
       ${tabBtn('reports','Lab reports')}
       ${tabBtn('catalog','Test catalog')}
+      <div style="width:1px;background:${LINE};margin:6px 2px;"></div>
+      ${isEditor ? tabBtn('adddoc','Add document') : ''}
+      ${tabBtn('documents','Documents')}
     </div>
     ${body}
     ${renderLightbox()}
@@ -1228,6 +1662,112 @@ function wireEvents(){
   if(lbPrev) lbPrev.onclick = ()=>{ lightboxIndex = (lightboxIndex - 1 + lightboxPhotos.length) % lightboxPhotos.length; render(); };
   const lbNext = root.querySelector('#lt-lightbox-next');
   if(lbNext) lbNext.onclick = ()=>{ lightboxIndex = (lightboxIndex + 1) % lightboxPhotos.length; render(); };
+
+  // --- Add Document tab ---
+  const docUploadBtn = root.querySelector('#lt-docupload-btn');
+  const docFileInput = root.querySelector('#lt-docfile-input');
+  if(docUploadBtn && docFileInput){
+    docUploadBtn.onclick = ()=> docFileInput.click();
+    docFileInput.onchange = (e)=>{ const f = e.target.files[0]; if(f) extractDocumentFromImage(f, false); };
+  }
+  const docUploadAppendBtn = root.querySelector('#lt-docupload-append-btn');
+  const docFileInputAppend = root.querySelector('#lt-docfile-input-append');
+  if(docUploadAppendBtn && docFileInputAppend){
+    docUploadAppendBtn.onclick = ()=> docFileInputAppend.click();
+    docFileInputAppend.onchange = (e)=>{ const f = e.target.files[0]; if(f) extractDocumentFromImage(f, true); };
+  }
+  const docMetaFields = [
+    ['lt-doc-date','date'], ['lt-doc-reporteddate','reportedDate'], ['lt-doc-type','documentType'],
+    ['lt-doc-facility','facility'], ['lt-doc-ordering','orderingPhysician'], ['lt-doc-reading','readingPhysician'],
+    ['lt-doc-additional','additionalPhysicians'], ['lt-doc-accession','accessionNumber'],
+    ['lt-doc-encounter','encounterId'], ['lt-doc-indication','indication'],
+    ['lt-doc-findings','findingsText'], ['lt-doc-impression','impressionText']
+  ];
+  for(const [id, field] of docMetaFields){
+    const el = root.querySelector('#'+id);
+    if(el) el.onchange = (e)=>{ if(pendingDocExtraction) pendingDocExtraction[field] = e.target.value; };
+  }
+  const addSignalBtn = root.querySelector('#lt-add-signal-row');
+  if(addSignalBtn) addSignalBtn.onclick = ()=>{
+    pendingDocExtraction.signalRows.push({
+      rowId: uid(), include:true, type:'finding', domain:'', subdomain:'', structureTag:'',
+      regionTags:[], isAncillary:false, isNegative:false, text:'', measurementValue:'',
+      measurementUnit:'', measurementLabel:'', hasRecommendation:false, recommendationText:''
+    });
+    render();
+  };
+  const saveDocBtn = root.querySelector('#lt-save-doc-extraction');
+  if(saveDocBtn) saveDocBtn.onclick = saveDocExtraction;
+  const cancelDocBtn = root.querySelector('#lt-cancel-doc-extraction');
+  if(cancelDocBtn) cancelDocBtn.onclick = ()=>{ pendingDocExtraction = null; docExtractError=''; render(); };
+
+  // Signal card fields -- mutate in place, no full re-render needed except for toggles/removal
+  function findSigRow(rowId){ return pendingDocExtraction ? pendingDocExtraction.signalRows.find(r=>r.rowId===rowId) : null; }
+  root.querySelectorAll('.lt-sig-include').forEach(el=>{ el.onchange = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r){ r.include=e.target.checked; render(); } }; });
+  root.querySelectorAll('.lt-sig-type').forEach(el=>{ el.onchange = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.type=e.target.value; }; });
+  root.querySelectorAll('.lt-sig-domain').forEach(el=>{ el.oninput = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.domain=e.target.value; }; });
+  root.querySelectorAll('.lt-sig-subdomain').forEach(el=>{ el.oninput = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.subdomain=e.target.value; }; });
+  root.querySelectorAll('.lt-sig-structure').forEach(el=>{ el.oninput = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.structureTag=e.target.value; }; });
+  root.querySelectorAll('.lt-sig-region').forEach(el=>{
+    el.onclick = ()=>{
+      const r = findSigRow(el.getAttribute('data-row'));
+      const region = el.getAttribute('data-region');
+      if(!r) return;
+      if(r.regionTags.includes(region)) r.regionTags = r.regionTags.filter(x=>x!==region);
+      else r.regionTags.push(region);
+      render();
+    };
+  });
+  root.querySelectorAll('.lt-sig-ancillary').forEach(el=>{ el.onchange = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.isAncillary=e.target.checked; }; });
+  root.querySelectorAll('.lt-sig-negative').forEach(el=>{ el.onchange = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.isNegative=e.target.checked; }; });
+  root.querySelectorAll('.lt-sig-text').forEach(el=>{ el.oninput = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.text=e.target.value; }; });
+  root.querySelectorAll('.lt-sig-measval').forEach(el=>{ el.oninput = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.measurementValue=e.target.value; }; });
+  root.querySelectorAll('.lt-sig-measunit').forEach(el=>{ el.oninput = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.measurementUnit=e.target.value; }; });
+  root.querySelectorAll('.lt-sig-measlabel').forEach(el=>{ el.oninput = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.measurementLabel=e.target.value; }; });
+  root.querySelectorAll('.lt-sig-hasrec').forEach(el=>{ el.onchange = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.hasRecommendation=e.target.checked; }; });
+  root.querySelectorAll('.lt-sig-rectext').forEach(el=>{ el.oninput = e=>{ const r=findSigRow(el.getAttribute('data-row')); if(r) r.recommendationText=e.target.value; }; });
+  root.querySelectorAll('.lt-sig-remove').forEach(el=>{
+    el.onclick = ()=>{ pendingDocExtraction.signalRows = pendingDocExtraction.signalRows.filter(r=>r.rowId!==el.getAttribute('data-row')); render(); };
+  });
+
+  // --- Documents tab ---
+  root.querySelectorAll('.lt-doc-row').forEach(el=>{
+    el.onclick = ()=>{ const id = el.getAttribute('data-doc'); expandedDoc = expandedDoc===id ? null : id; editingDocId = null; deletingDocId = null; render(); };
+  });
+  root.querySelectorAll('.lt-doc-edit-start').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); editingDocId = el.getAttribute('data-doc'); render(); };
+  });
+  root.querySelectorAll('.lt-doc-edit-cancel').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); editingDocId = null; render(); };
+  });
+  root.querySelectorAll('.lt-doc-edit-save').forEach(el=>{
+    el.onclick = (e)=>{
+      e.stopPropagation();
+      const docId = el.getAttribute('data-doc');
+      const g = cls => root.querySelector(`.${cls}[data-doc="${docId}"]`);
+      editDoc(docId,
+        g('lt-doc-edit-date')?.value, g('lt-doc-edit-reported')?.value, g('lt-doc-edit-type')?.value,
+        g('lt-doc-edit-ordering')?.value, g('lt-doc-edit-reading')?.value, g('lt-doc-edit-additional')?.value,
+        g('lt-doc-edit-facility')?.value, g('lt-doc-edit-accession')?.value, g('lt-doc-edit-encounter')?.value,
+        g('lt-doc-edit-indication')?.value);
+    };
+  });
+  root.querySelectorAll('.lt-doc-delete-start').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); deletingDocId = el.getAttribute('data-doc'); render(); };
+  });
+  root.querySelectorAll('.lt-doc-delete-cancel').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); deletingDocId = null; render(); };
+  });
+  root.querySelectorAll('.lt-doc-delete-confirm').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); deleteDoc(el.getAttribute('data-doc')); };
+  });
+  root.querySelectorAll('.lt-sig-hide-toggle').forEach(el=>{
+    el.onclick = (e)=>{
+      e.stopPropagation();
+      const sig = SIGNALS.find(s=>s.id===el.getAttribute('data-signal'));
+      if(sig){ sig.hidden = !sig.hidden; saveSignals(); render(); }
+    };
+  });
 }
 
 (async function bootstrap(){
